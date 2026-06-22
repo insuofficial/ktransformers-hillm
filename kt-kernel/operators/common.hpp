@@ -10,8 +10,10 @@
 #include <arm_sve.h>
 #endif
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -76,6 +78,22 @@ template <typename T>
 T* offset_pointer_col_major(T* t, int row, int col, size_t ld) {
   return offset_pointer(t, col * ld) + row;
 }
+
+// RAII timer that records the elapsed wall-clock (ns) of its enclosing scope into
+// `sink` on destruction. Used by the TP MoE forward paths to expose pure
+// CPU-compute time (the work that runs ON the worker thread) so gen_config can
+// calibrate cpu_* without the Python submit prep / D2H-H2D copy / sync overhead.
+// `sink` is written by the worker thread and read by Python after CPUInfer::sync,
+// which establishes the happens-before; relaxed atomics suffice.
+struct KtComputeTimer {
+  std::atomic<int64_t>* sink;
+  std::chrono::steady_clock::time_point t0;
+  explicit KtComputeTimer(std::atomic<int64_t>& s) : sink(&s), t0(std::chrono::steady_clock::now()) {}
+  ~KtComputeTimer() {
+    sink->store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                std::memory_order_relaxed);
+  }
+};
 
 class TimePerf {
  protected:
@@ -276,6 +294,9 @@ struct GeneralMOEConfig {
   std::vector<std::vector<void*>> gate_projs;
   std::vector<std::vector<void*>> up_projs;
   std::vector<std::vector<void*>> down_projs;
+  std::vector<std::vector<void*>> gate_biases;
+  std::vector<std::vector<void*>> up_biases;
+  std::vector<std::vector<void*>> down_biases;
   std::vector<std::vector<void*>> gate_scales;
   std::vector<std::vector<void*>> up_scales;
   std::vector<std::vector<void*>> down_scales;
@@ -307,6 +328,9 @@ struct GeneralMOEConfig {
   int hidden_type;
 
   int max_cache_depth = 1;
+
+  // 0: existing SiLU/SwiGLU path, 1: gpt-oss gated activation.
+  int activation_type = 0;
 
   // SwiGLU asymmetric clamp applied to gate/up before silu*up. 0.0f =
   // disabled (default for all non-MXFP4 paths). Set to e.g. 10.0f for

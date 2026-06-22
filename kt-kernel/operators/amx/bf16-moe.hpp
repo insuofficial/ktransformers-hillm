@@ -107,13 +107,14 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
 
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
     int m = m_local_num_[expert_idx];
+    auto& bb = down_bb_[expert_idx];
 
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx], down_bb_[expert_idx],
-                   down_bc_[expert_idx], ith, nth);
+      amx::mat_mul(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx], bb, down_bc_[expert_idx],
+                   ith, nth);
     } else {
-      amx::vec_mul(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx], down_bb_[expert_idx],
-                   down_bc_[expert_idx], ith, nth);
+      amx::vec_mul(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx], bb, down_bc_[expert_idx],
+                   ith, nth);
     }
   }
 

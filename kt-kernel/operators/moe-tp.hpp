@@ -35,12 +35,23 @@ class TP_MOE_Common : public MoE_Interface {
 
   bool weights_loaded = false;
 
+  // Pure CPU-compute time (ns) of the most recent forward / packed_forward /
+  // (packed_)gate_up task, measured ON the worker thread via KtComputeTimer --
+  // excludes the Python submit prep, enqueue/dispatch latency, the D2H input /
+  // H2D output copies and the sync wait. Read by gen_config (after CPUInfer::sync)
+  // to calibrate cpu_* as compute-only. Overwritten per task; profiling submits
+  // one task then syncs and reads, so the last value is the one it measured.
+  std::atomic<int64_t> last_compute_ns_{0};
+
 #ifdef FORWARD_TIME_REPORT
   size_t forward_time_sum_ns = 0;
   size_t forward_count = 0;
 #endif
  public:
   GeneralMOEConfig config;
+
+  // Worker-thread compute time (ns) of the most recent forward task (see above).
+  int64_t last_compute_ns() const { return last_compute_ns_.load(std::memory_order_relaxed); }
   using input_t = typename T::input_t;
   TP_MOE_Common(const GeneralMOEConfig& config) : config(config) {
     printf("TP MOE layer %d, pool: 0x%lx, expert num: %d, num_experts_per_tok: %d\n", config.layer_idx,
@@ -165,11 +176,18 @@ class TP_MOE_Common : public MoE_Interface {
             incremental);
   }
 
+  void packed_forward_binding(int expert_count, intptr_t expert_indices, intptr_t expert_counts, intptr_t weights,
+                              intptr_t input, intptr_t output, bool incremental) {
+    packed_forward(expert_count, (const int64_t*)expert_indices, (const int32_t*)expert_counts, (const float*)weights,
+                   (const void*)input, (void*)output, incremental);
+  }
+
   void forward(int* qlen_ptr, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output,
                bool incremental) {
     if (weights_loaded == false) [[unlikely]] {
       throw std::runtime_error("Not Loaded");
     }
+    KtComputeTimer _ct(last_compute_ns_);
 #ifdef FORWARD_TIME_REPORT
     auto start = std::chrono::high_resolution_clock::now();
 #endif
@@ -210,6 +228,45 @@ class TP_MOE_Common : public MoE_Interface {
         forward_time, end.time_since_epoch().count() / 1000 % 100000000, band_width, average_bandwidth, GFLOPS,
         numa_node_of_cpu(sched_getcpu()));
 #endif
+  }
+
+  void packed_forward(int expert_count, const int64_t* expert_indices, const int32_t* expert_counts,
+                      const float* weights, const void* input, void* output, bool incremental = false) {
+    if (weights_loaded == false) [[unlikely]] {
+      throw std::runtime_error("Not Loaded");
+    }
+    if (incremental) [[unlikely]] {
+      throw std::runtime_error("Packed forward does not support incremental accumulation.");
+    }
+    KtComputeTimer _ct(last_compute_ns_);
+
+    int rows = 0;
+    for (int i = 0; i < expert_count; i++) {
+      if (expert_counts[i] < 0) [[unlikely]] {
+        throw std::runtime_error("Packed forward got a negative expert count.");
+      }
+      rows += expert_counts[i];
+    }
+    if (rows == 0) {
+      return;
+    }
+    if (rows > config.max_possible_qlen()) [[unlikely]] {
+      throw std::runtime_error("Packed forward rows exceed max_possible_qlen.");
+    }
+
+    auto pool = config.pool;
+    pool->dispense_backend()->do_numa_job(
+        [this, pool, expert_count, expert_indices, expert_counts, input, weights](int numa_id) {
+          if constexpr (requires(T* tp, int ec, const int64_t* ei, const int32_t* cnt, const float* w, const void* in,
+                                 void* out) { tp->forward_packed(ec, ei, cnt, w, in, out); }) {
+            tps[numa_id]->forward_packed(expert_count, expert_indices, expert_counts, weights, input,
+                                         this->local_output_numa[numa_id]);
+          } else {
+            throw std::runtime_error("Packed forward is not implemented for this MoE backend.");
+          }
+        });
+
+    merge_results(rows, output, false);
   }
 
   virtual void load_weights() = 0;

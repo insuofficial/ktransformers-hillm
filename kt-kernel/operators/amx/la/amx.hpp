@@ -100,6 +100,22 @@ static inline __m512 act_fn(__m512 gate_val, __m512 up_val, float swiglu_limit, 
   return act_fn(gate_val, up_val, swiglu_limit);
 }
 
+static inline __m512 gpt_oss_act_fn(__m512 gate_val, __m512 up_val) {
+  const __m512 pos7 = _mm512_set1_ps(7.0f);
+  const __m512 neg7 = _mm512_set1_ps(-7.0f);
+  gate_val = _mm512_min_ps(gate_val, pos7);
+  up_val = _mm512_min_ps(up_val, pos7);
+  up_val = _mm512_max_ps(up_val, neg7);
+
+  __m512 exp_input = _mm512_mul_ps(_mm512_set1_ps(-1.702f), gate_val);
+  exp_input = _mm512_min_ps(exp_input, _mm512_set1_ps(88.0f));
+  __m512 sigmoid = _mm512_div_ps(
+      _mm512_set1_ps(1.0f),
+      _mm512_add_ps(_mm512_set1_ps(1.0f), exp_avx512(exp_input)));
+  __m512 glu = _mm512_mul_ps(gate_val, sigmoid);
+  return _mm512_mul_ps(_mm512_add_ps(up_val, _mm512_set1_ps(1.0f)), glu);
+}
+
 #define AMX_DISPATCH_QTYPES(QA, QB, ...)                                 \
   [&] {                                                                  \
     switch (QB) {                                                        \

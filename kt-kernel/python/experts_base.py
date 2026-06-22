@@ -82,6 +82,7 @@ class KExpertsCPUBuffer:
     capture_bs: List = list()
     capture_buffers: Dict = dict()
     temp_bs: int = 0
+    temp_key: tuple = tuple()
     temp_buffer: tuple = tuple()
     buffer_depth: int = 2
 
@@ -89,12 +90,20 @@ class KExpertsCPUBuffer:
     def get_buffer(cls, hidden_states: torch.Tensor, num_experts_per_tok):
         hidden_size = hidden_states.shape[-1]
         batch_size = hidden_states.shape[0]
+        buffer_key = (
+            batch_size,
+            hidden_size,
+            hidden_states.device.type,
+            hidden_states.device.index,
+            hidden_states.dtype,
+            int(num_experts_per_tok),
+        )
 
         pin_memory = True
 
-        if batch_size in cls.capture_buffers:
-            return cls.capture_buffers[batch_size]
-        if batch_size == cls.temp_bs:
+        if buffer_key in cls.capture_buffers:
+            return cls.capture_buffers[buffer_key]
+        if buffer_key == cls.temp_key:
             return cls.temp_buffer
 
         input_tensor_cpu = [
@@ -136,8 +145,9 @@ class KExpertsCPUBuffer:
             output_gpu,
         )
         if batch_size in cls.capture_bs:
-            cls.capture_buffers[batch_size] = cur_buffer
+            cls.capture_buffers[buffer_key] = cur_buffer
         cls.temp_bs = batch_size
+        cls.temp_key = buffer_key
         cls.temp_buffer = cur_buffer
         return cur_buffer
 
@@ -540,5 +550,5 @@ class BaseMoEWrapper(_MoEBase, ABC):
         """
         KExpertsCPUBuffer.capture_buffers.clear()
         KExpertsCPUBuffer.temp_bs = 0
+        KExpertsCPUBuffer.temp_key = tuple()
         KExpertsCPUBuffer.temp_buffer = tuple()
-

@@ -48,6 +48,7 @@ class AMX_MOE_BASE {
   std::vector<std::vector<int>> m_local_pos_;
   std::vector<int> m_local_num_;
   std::vector<int> m_expert_id_map_;
+  std::vector<int> m_packed_offset_;
   std::vector<ggml_bf16_t*> m_local_input_ptr_;
   std::vector<ggml_bf16_t*> m_local_gate_output_ptr_;
   std::vector<ggml_bf16_t*> m_local_up_output_ptr_;
@@ -104,6 +105,7 @@ class AMX_MOE_BASE {
       m_local_pos_[i].resize(config_.num_experts_per_tok);
     }
     m_expert_id_map_.resize(config_.expert_num);
+    m_packed_offset_.resize(config_.expert_num);
     m_local_num_.resize(config_.expert_num);
     m_local_input_ptr_.resize(config_.expert_num);
     m_local_gate_output_ptr_.resize(config_.expert_num);
@@ -117,17 +119,19 @@ class AMX_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
-      void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* gate_bb_ptr = std::aligned_alloc(
+          64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* up_bb_ptr = std::aligned_alloc(
+          64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
-      void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+      void* down_bb_ptr = std::aligned_alloc(
+          64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
+
     // TODO: need update to all *.hpp
     // (config_.expert_num * T::M_STEP) in pool_count_ is to ensure padding for each experts.
     pool_count_ = (size_t)config_.max_len * config_.num_experts_per_tok + config_.expert_num * T::M_STEP;
@@ -146,8 +150,6 @@ class AMX_MOE_BASE {
 
     shared_mem_buffer_numa.alloc(tp_part_idx, this, mem_requests);
   }
-
-  ~AMX_MOE_BASE() = default;
 
   void warm_up() {
     int qlen = config_.max_len;
@@ -170,6 +172,37 @@ class AMX_MOE_BASE {
     }
   }
 
+  // gate_up-only forward (HiLLM shard tier): run gate/up GEMM + activation on the
+  // CPU for the (masked) experts and write the packed intermediate to `output` as
+  // bf16 [total_tokens, intermediate_size]; skip the down GEMM and weighted
+  // combine -- the caller runs the down projection on the GPU. routing `weights`
+  // are ignored here (applied by the caller after down). Reuses the standard
+  // forward_prefill/forward_decode prefix, so the intermediate is identical to
+  // what the CPU tier would feed into down (incl. any gate/up bias + gpt-oss act).
+  void forward_gate_up(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
+                       void* output) {
+    if (qlen > 1) {
+      forward_prefill(qlen, k, expert_ids, weights, input, output, /*gate_up_only=*/true);
+    } else {
+      forward_decode(k, expert_ids, weights, input, output, /*gate_up_only=*/true);
+    }
+  }
+
+  // Copy the post-activation intermediate of every activated expert into `output`
+  // as bf16, contiguous and ordered by ascending expert id (tokens within an
+  // expert keep kt's packed order, which matches HiLLM's stable-argsort packing).
+  void copy_gate_up_intermediate(void* output) {
+    ggml_bf16_t* out = (ggml_bf16_t*)output;
+    const size_t I = config_.intermediate_size;
+    size_t off = 0;
+    for (int e = 0; e < config_.expert_num; e++) {
+      int n = m_local_num_[e];
+      if (n == 0) continue;
+      std::memcpy(out + off * I, m_local_gate_output_ptr_[e], (size_t)n * I * sizeof(ggml_bf16_t));
+      off += n;
+    }
+  }
+
   template <typename... Args>
   void load_weights(Args&&... args) {
     derived()->load_weights(std::forward<Args>(args)...);
@@ -181,7 +214,7 @@ class AMX_MOE_BASE {
   }
 
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-                       void* output) {
+                       void* output, bool gate_up_only = false) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
 #ifdef FORWARD_TIME_PROFILE
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -361,6 +394,13 @@ class AMX_MOE_BASE {
     }
 #endif
 
+    // HiLLM shard tier: stop after gate_up+activation and hand the packed
+    // intermediate back to the caller (which runs down on the GPU).
+    if (gate_up_only) {
+      copy_gate_up_intermediate(output);
+      return;
+    }
+
     pool->do_work_stealing_job(
         activated_expert, nullptr,
         [this](int task_id) {
@@ -411,6 +451,8 @@ class AMX_MOE_BASE {
               avx512_32xbf16_to_32xfp32((__m512i*)(m_local_down_output_ptr_[expert_ids[i * k + j]] +
                                                    m_local_pos_[i][j] * config_.hidden_size + e),
                                         &down_output0, &down_output1);
+              const ggml_bf16_t* down_bias = down_bias_ptr(expert_ids[i * k + j]);
+              add_bias_tile(down_bias, e, down_output0, down_output1);
               x0 = _mm512_fmadd_ps(down_output0, weight, x0);
               x1 = _mm512_fmadd_ps(down_output1, weight, x1);
             }
@@ -438,7 +480,321 @@ class AMX_MOE_BASE {
 #endif
   }
 
-  void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+  void forward_packed(int expert_count, const int64_t* expert_indices, const int32_t* expert_counts,
+                      const float* weights, const void* input, void* output) {
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+
+    std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+
+    int activated_expert = 0;
+    int rows = 0;
+    for (int i = 0; i < expert_count; i++) {
+      int expert_idx = (int)expert_indices[i];
+      int count = expert_counts[i];
+      if (count == 0) {
+        continue;
+      }
+      if (count < 0 || config_.should_skip_expert(expert_idx)) [[unlikely]] {
+        throw std::runtime_error("Packed forward received an invalid or skipped expert.");
+      }
+      m_expert_id_map_[activated_expert++] = expert_idx;
+      m_local_num_[expert_idx] = count;
+      m_packed_offset_[expert_idx] = rows;
+      m_local_input_ptr_[expert_idx] =
+          (ggml_bf16_t*)input + (size_t)m_packed_offset_[expert_idx] * config_.hidden_size;
+      rows += count;
+    }
+
+    if (activated_expert == 0) {
+      return;
+    }
+
+    size_t offset = 0;
+    void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
+    void* gate_bc_pool_ptr = gate_bc_pool_;
+    void* up_bc_pool_ptr = up_bc_pool_;
+    void* down_ba_pool_ptr = down_ba_pool_;
+    void* down_bc_pool_ptr = down_bc_pool_;
+    constexpr size_t M_STEP = T::M_STEP;
+    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
+    size_t used_pool_m = 0;
+    size_t used_pool_bytes_a = 0, used_pool_bytes_bc_gate = 0, used_pool_bytes_bc_up = 0, used_pool_bytes_ba_down = 0,
+           used_pool_bytes_bc_down = 0;
+
+    for (int task_id = 0; task_id < activated_expert; task_id++) {
+      int expert_idx = m_expert_id_map_[task_id];
+      int count = m_local_num_[expert_idx];
+
+      m_local_gate_output_ptr_[expert_idx] = m_local_gate_output_ + offset * config_.intermediate_size;
+      m_local_up_output_ptr_[expert_idx] = m_local_up_output_ + offset * config_.intermediate_size;
+      m_local_down_output_ptr_[expert_idx] = m_local_down_output_ + offset * config_.hidden_size;
+      offset += count;
+
+      size_t max_m = (count + M_STEP - 1) / M_STEP * M_STEP;
+      gate_up_ba_[expert_idx]->max_m = max_m;
+      gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
+      size_t ba_size = align64(buffer_a_required_size(max_m, config_.hidden_size));
+      gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
+
+      gate_bc_[expert_idx]->max_m = max_m;
+      gate_bc_[expert_idx]->set_data(gate_bc_pool_ptr);
+      size_t bc_gate_size = align64(buffer_c_required_size(max_m, config_.intermediate_size));
+      gate_bc_pool_ptr = (void*)((uintptr_t)gate_bc_pool_ptr + bc_gate_size);
+
+      up_bc_[expert_idx]->max_m = max_m;
+      up_bc_[expert_idx]->set_data(up_bc_pool_ptr);
+      size_t bc_up_size = align64(buffer_c_required_size(max_m, config_.intermediate_size));
+      up_bc_pool_ptr = (void*)((uintptr_t)up_bc_pool_ptr + bc_up_size);
+
+      down_ba_[expert_idx]->max_m = max_m;
+      down_ba_[expert_idx]->set_data(down_ba_pool_ptr);
+      size_t ba_down_size = align64(buffer_a_required_size(max_m, config_.intermediate_size));
+      down_ba_pool_ptr = (void*)((uintptr_t)down_ba_pool_ptr + ba_down_size);
+
+      down_bc_[expert_idx]->max_m = max_m;
+      down_bc_[expert_idx]->set_data(down_bc_pool_ptr);
+      size_t bc_down_size = align64(buffer_c_required_size(max_m, config_.hidden_size));
+      down_bc_pool_ptr = (void*)((uintptr_t)down_bc_pool_ptr + bc_down_size);
+
+      used_pool_m += max_m;
+      used_pool_bytes_a += ba_size;
+      used_pool_bytes_bc_gate += bc_gate_size;
+      used_pool_bytes_bc_up += bc_up_size;
+      used_pool_bytes_ba_down += ba_down_size;
+      used_pool_bytes_bc_down += bc_down_size;
+    }
+
+    assert(used_pool_m <= pool_count_);
+    assert(used_pool_bytes_a <= gate_up_ba_pool_bytes_);
+    assert(used_pool_bytes_bc_gate <= gate_bc_pool_bytes_);
+    assert(used_pool_bytes_bc_up <= up_bc_pool_bytes_);
+    assert(used_pool_bytes_ba_down <= down_ba_pool_bytes_);
+    assert(used_pool_bytes_bc_down <= down_bc_pool_bytes_);
+
+    auto direct_or_pool = [&](int count, auto&& fn) {
+      if (rows < 10) {
+        for (int i = 0; i < count; i++) {
+          fn(i);
+        }
+      } else {
+        pool->do_work_stealing_job(count, nullptr, fn, nullptr);
+      }
+    };
+
+    direct_or_pool(activated_expert, [this](int task_id) {
+      int expert_idx = m_expert_id_map_[task_id];
+      gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
+    });
+
+    int nth = T::recommended_nth(config_.intermediate_size);
+    pool->do_work_stealing_job(
+        nth * activated_expert * 2, [](int _) { T::config(); },
+        [this, nth](int task_id2) {
+          int task_id = task_id2 / 2;
+          bool do_up = task_id2 % 2;
+          int expert_idx = m_expert_id_map_[task_id / nth];
+
+          int ith = task_id % nth;
+          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, m_local_num_[expert_idx]);
+          if (do_up) {
+            up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
+          } else {
+            gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith, nth);
+          }
+        },
+        nullptr);
+
+    apply_activation(activated_expert, nth, rows);
+
+    direct_or_pool(activated_expert, [this](int task_id) {
+      int expert_idx = m_expert_id_map_[task_id];
+      down_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], 0, 1);
+    });
+
+    nth = T::recommended_nth(config_.hidden_size);
+    pool->do_work_stealing_job(
+        nth * activated_expert, [](int _) { T::config(); },
+        [this, nth](int task_id) {
+          int expert_idx = m_expert_id_map_[task_id / nth];
+          int ith = task_id % nth;
+          derived()->do_down_gemm(expert_idx, ith, nth, m_local_num_[expert_idx]);
+          down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_down_output_ptr_[expert_idx], ith, nth);
+        },
+        nullptr);
+
+    direct_or_pool(activated_expert, [this, output, weights](int task_id) {
+      int expert_idx = m_expert_id_map_[task_id];
+      int row_offset = m_packed_offset_[expert_idx];
+      int count = m_local_num_[expert_idx];
+      for (int i = 0; i < count; i++) {
+        int row = row_offset + i;
+        for (int e = 0; e < config_.hidden_size; e += 32) {
+          __m512 weight = _mm512_set1_ps(weights[row]);
+          __m512 down_output0, down_output1;
+          avx512_32xbf16_to_32xfp32(
+              (__m512i*)(m_local_down_output_ptr_[expert_idx] + i * config_.hidden_size + e), &down_output0,
+              &down_output1);
+          const ggml_bf16_t* down_bias = down_bias_ptr(expert_idx);
+          add_bias_tile(down_bias, e, down_output0, down_output1);
+          auto f32out = (__m512*)((float*)output + (size_t)row * config_.hidden_size + e);
+          f32out[0] = _mm512_mul_ps(down_output0, weight);
+          f32out[1] = _mm512_mul_ps(down_output1, weight);
+        }
+      }
+    });
+  }
+
+  // Packed gate_up for HiLLM's shard tier. Like forward_packed, the hidden states
+  // are ALREADY grouped by expert (expert_indices[i] gets expert_counts[i]
+  // contiguous rows of `input`), so there is no token scan and no gather. Unlike
+  // forward_packed it deliberately does NOT consult should_skip_expert /
+  // gpu_experts_mask -- it processes exactly the experts it is given. That makes it
+  // immune to the per-step mask the CPU tier flips (set_cpu_experts), so cpu (mask)
+  // and shard (explicit experts) can run in the same layer. Stops after
+  // gate_up+activation and writes the packed intermediate [sum(counts),
+  // full_intermediate_size] bf16 to `output` (ordered to match `input`); the caller
+  // runs the down projection on the GPU.
+  //
+  // This TP part owns intermediate columns [tp_part_idx*I_local, (tp_part_idx+1)*
+  // I_local) of the natural-order split (config_.intermediate_size == I_local; see
+  // TP_MOE::load_weights). It writes ITS column-slice into the shared full-width
+  // [rows, full_intermediate_size] `output` at that column offset, with a row stride
+  // of full_intermediate_size. With tp_count>1 the parts touch disjoint columns of
+  // the same buffer, so the outer dispatcher can fan this out over NUMA with no merge
+  // step. For tp_count==1 (full_intermediate_size == I_local) it degenerates to the
+  // old contiguous write.
+  void packed_gate_up(int expert_count, const int64_t* expert_indices, const int32_t* expert_counts,
+                      const void* input, void* output, int full_intermediate_size) {
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+
+    std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+
+    int activated_expert = 0;
+    int rows = 0;
+    for (int i = 0; i < expert_count; i++) {
+      int expert_idx = (int)expert_indices[i];
+      int count = expert_counts[i];
+      if (count == 0) {
+        continue;
+      }
+      if (count < 0 || expert_idx < 0 || expert_idx >= config_.expert_num) [[unlikely]] {
+        throw std::runtime_error("packed_gate_up received an invalid expert index/count.");
+      }
+      m_expert_id_map_[activated_expert++] = expert_idx;
+      m_local_num_[expert_idx] = count;
+      m_packed_offset_[expert_idx] = rows;
+      m_local_input_ptr_[expert_idx] = (ggml_bf16_t*)input + (size_t)rows * config_.hidden_size;
+      rows += count;
+    }
+
+    if (activated_expert == 0) {
+      return;
+    }
+
+    size_t offset = 0;
+    void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
+    void* gate_bc_pool_ptr = gate_bc_pool_;
+    void* up_bc_pool_ptr = up_bc_pool_;
+    constexpr size_t M_STEP = T::M_STEP;
+    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
+    size_t used_pool_m = 0;
+    size_t used_pool_bytes_a = 0, used_pool_bytes_bc_gate = 0, used_pool_bytes_bc_up = 0;
+
+    for (int task_id = 0; task_id < activated_expert; task_id++) {
+      int expert_idx = m_expert_id_map_[task_id];
+      int count = m_local_num_[expert_idx];
+
+      m_local_gate_output_ptr_[expert_idx] = m_local_gate_output_ + offset * config_.intermediate_size;
+      m_local_up_output_ptr_[expert_idx] = m_local_up_output_ + offset * config_.intermediate_size;
+      offset += count;
+
+      size_t max_m = (count + M_STEP - 1) / M_STEP * M_STEP;
+      gate_up_ba_[expert_idx]->max_m = max_m;
+      gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
+      size_t ba_size = align64(buffer_a_required_size(max_m, config_.hidden_size));
+      gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
+
+      gate_bc_[expert_idx]->max_m = max_m;
+      gate_bc_[expert_idx]->set_data(gate_bc_pool_ptr);
+      size_t bc_gate_size = align64(buffer_c_required_size(max_m, config_.intermediate_size));
+      gate_bc_pool_ptr = (void*)((uintptr_t)gate_bc_pool_ptr + bc_gate_size);
+
+      up_bc_[expert_idx]->max_m = max_m;
+      up_bc_[expert_idx]->set_data(up_bc_pool_ptr);
+      size_t bc_up_size = align64(buffer_c_required_size(max_m, config_.intermediate_size));
+      up_bc_pool_ptr = (void*)((uintptr_t)up_bc_pool_ptr + bc_up_size);
+
+      used_pool_m += max_m;
+      used_pool_bytes_a += ba_size;
+      used_pool_bytes_bc_gate += bc_gate_size;
+      used_pool_bytes_bc_up += bc_up_size;
+    }
+
+    assert(used_pool_m <= pool_count_);
+    assert(used_pool_bytes_a <= gate_up_ba_pool_bytes_);
+    assert(used_pool_bytes_bc_gate <= gate_bc_pool_bytes_);
+    assert(used_pool_bytes_bc_up <= up_bc_pool_bytes_);
+
+    auto direct_or_pool = [&](int count, auto&& fn) {
+      if (rows < 10) {
+        for (int i = 0; i < count; i++) {
+          fn(i);
+        }
+      } else {
+        pool->do_work_stealing_job(count, nullptr, fn, nullptr);
+      }
+    };
+
+    direct_or_pool(activated_expert, [this](int task_id) {
+      int expert_idx = m_expert_id_map_[task_id];
+      gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
+    });
+
+    int nth = T::recommended_nth(config_.intermediate_size);
+    pool->do_work_stealing_job(
+        nth * activated_expert * 2, [](int _) { T::config(); },
+        [this, nth](int task_id2) {
+          int task_id = task_id2 / 2;
+          bool do_up = task_id2 % 2;
+          int expert_idx = m_expert_id_map_[task_id / nth];
+
+          int ith = task_id % nth;
+          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, m_local_num_[expert_idx]);
+          if (do_up) {
+            up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
+          } else {
+            gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith, nth);
+          }
+        },
+        nullptr);
+
+    apply_activation(activated_expert, nth, rows);
+
+    // Write the packed post-activation intermediate (bf16) into the full-width
+    // [rows, full_intermediate_size] output -- one [count, I_local] block per expert
+    // at its row offset, placed at this TP part's column offset. Each row is copied
+    // separately because dst rows are full_intermediate_size apart while src rows are
+    // I_local apart; the single contiguous memcpy is recovered when they are equal
+    // (tp_count==1).
+    const int i_local = config_.intermediate_size;
+    const size_t col_offset = (size_t)tp_part_idx * (size_t)i_local;
+    direct_or_pool(activated_expert,
+                   [this, output, full_intermediate_size, i_local, col_offset](int task_id) {
+                     int expert_idx = m_expert_id_map_[task_id];
+                     int count = m_local_num_[expert_idx];
+                     size_t row_offset = (size_t)m_packed_offset_[expert_idx];
+                     const ggml_bf16_t* src = m_local_gate_output_ptr_[expert_idx];
+                     ggml_bf16_t* dst =
+                         (ggml_bf16_t*)output + row_offset * (size_t)full_intermediate_size + col_offset;
+                     for (int r = 0; r < count; r++) {
+                       std::memcpy(dst + (size_t)r * (size_t)full_intermediate_size,
+                                   src + (size_t)r * (size_t)i_local, (size_t)i_local * sizeof(ggml_bf16_t));
+                     }
+                   });
+  }
+
+  void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output,
+                      bool gate_up_only = false) {
     int qlen = 1;
     auto pool = config_.pool->get_subpool(tp_part_idx);
 #ifdef FORWARD_TIME_PROFILE
@@ -568,6 +924,12 @@ class AMX_MOE_BASE {
     }
 #endif
 
+    // HiLLM shard tier: stop after gate_up+activation (see forward_prefill).
+    if (gate_up_only) {
+      copy_gate_up_intermediate(output);
+      return;
+    }
+
     pool->do_work_stealing_job(
         activated_expert, nullptr,
         [this, qlen](int task_id) {
@@ -615,6 +977,8 @@ class AMX_MOE_BASE {
         avx512_32xbf16_to_32xfp32(
             (__m512i*)(m_local_down_output_ptr_[expert_ids[j]] + m_local_pos_[0][j] * config_.hidden_size + e),
             &down_output0, &down_output1);
+        const ggml_bf16_t* down_bias = down_bias_ptr(expert_ids[j]);
+        add_bias_tile(down_bias, e, down_output0, down_output1);
         x0 = _mm512_fmadd_ps(down_output0, weight, x0);
         x1 = _mm512_fmadd_ps(down_output1, weight, x1);
       }
@@ -672,12 +1036,48 @@ class AMX_MOE_BASE {
     return derived_const()->make_buffer_c_impl(m, n, data);
   }
 
+  const ggml_bf16_t* ptr_2d(const std::vector<std::vector<void*>>& ptrs, int expert_idx) const {
+    if (ptrs.empty() || ptrs[0].empty() || expert_idx < 0 || expert_idx >= (int)ptrs[0].size()) {
+      return nullptr;
+    }
+    return reinterpret_cast<const ggml_bf16_t*>(ptrs[0][expert_idx]);
+  }
+
+  const ggml_bf16_t* gate_bias_ptr(int expert_idx) const {
+    const ggml_bf16_t* ptr = ptr_2d(config_.gate_biases, expert_idx);
+    return ptr == nullptr ? nullptr : ptr + tp_part_idx * config_.intermediate_size;
+  }
+
+  const ggml_bf16_t* up_bias_ptr(int expert_idx) const {
+    const ggml_bf16_t* ptr = ptr_2d(config_.up_biases, expert_idx);
+    return ptr == nullptr ? nullptr : ptr + tp_part_idx * config_.intermediate_size;
+  }
+
+  const ggml_bf16_t* down_bias_ptr(int expert_idx) const {
+    if (tp_part_idx != 0) {
+      return nullptr;
+    }
+    return ptr_2d(config_.down_biases, expert_idx);
+  }
+
+  static void add_bias_tile(const ggml_bf16_t* bias, int offset, __m512& value0, __m512& value1) {
+    if (bias == nullptr) {
+      return;
+    }
+    __m512 bias0, bias1;
+    avx512_32xbf16_to_32xfp32((__m512i*)(bias + offset), &bias0, &bias1);
+    value0 = _mm512_add_ps(value0, bias0);
+    value1 = _mm512_add_ps(value1, bias1);
+  }
+
   void apply_activation(int activated_expert, int nth, int qlen) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
     auto fn = [this, nth](int task_id) {
       int expert_idx = m_expert_id_map_[task_id / nth];
       int ith = task_id % nth;
       auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
+      const ggml_bf16_t* gate_bias = gate_bias_ptr(expert_idx);
+      const ggml_bf16_t* up_bias = up_bias_ptr(expert_idx);
       for (int i = 0; i < m_local_num_[expert_idx]; i++) {
         ggml_bf16_t* gate_output_ptr = &m_local_gate_output_ptr_[expert_idx][i * config_.intermediate_size];
         ggml_bf16_t* up_output_ptr = &m_local_up_output_ptr_[expert_idx][i * config_.intermediate_size];
@@ -685,8 +1085,14 @@ class AMX_MOE_BASE {
           __m512 gate_val0, gate_val1, up_val0, up_val1;
           avx512_32xbf16_to_32xfp32((__m512i*)(gate_output_ptr + j), &gate_val0, &gate_val1);
           avx512_32xbf16_to_32xfp32((__m512i*)(up_output_ptr + j), &up_val0, &up_val1);
-          __m512 result0 = amx::act_fn(gate_val0, up_val0, config_.swiglu_limit, config_.swiglu_alpha);
-          __m512 result1 = amx::act_fn(gate_val1, up_val1, config_.swiglu_limit, config_.swiglu_alpha);
+          add_bias_tile(gate_bias, j, gate_val0, gate_val1);
+          add_bias_tile(up_bias, j, up_val0, up_val1);
+          __m512 result0 = config_.activation_type == 1
+                               ? amx::gpt_oss_act_fn(gate_val0, up_val0)
+                               : amx::act_fn(gate_val0, up_val0, config_.swiglu_limit, config_.swiglu_alpha);
+          __m512 result1 = config_.activation_type == 1
+                               ? amx::gpt_oss_act_fn(gate_val1, up_val1)
+                               : amx::act_fn(gate_val1, up_val1, config_.swiglu_limit, config_.swiglu_alpha);
           avx512_32xfp32_to_32xbf16(&result0, &result1, (__m512i*)(gate_output_ptr + j));
         }
       }
@@ -771,6 +1177,61 @@ class TP_MOE<AMX_MOE_BASE<T, Derived>> : public TP_MOE_Common<AMX_MOE_BASE<T, De
   }
 
   void merge_results(int qlen, void* output) override { merge_results(qlen, output, false); }
+
+  // gate_up-only forward for HiLLM's shard tier. Computes silu(gate)*up (or the
+  // gpt-oss activation) on the CPU (AMX) for the masked experts and writes the
+  // packed intermediate [total_tokens, intermediate_size] bf16 into `output`; the
+  // caller runs the down projection on the GPU. Single TP part only
+  // (threadpool_count==1) so the intermediate is not split across NUMA nodes.
+  void forward_gate_up(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
+                       void* output) {
+    if (this->weights_loaded == false) {
+      throw std::runtime_error("Not Loaded");
+    }
+    if (this->tp_count != 1) {
+      throw std::runtime_error("forward_gate_up requires threadpool_count==1 (single TP part)");
+    }
+    KtComputeTimer _ct(this->last_compute_ns_);
+    auto& tps = this->tps;
+    this->config.pool->dispense_backend()->do_numa_job(
+        [&tps, qlen, k, expert_ids, weights, input, output](int numa_id) {
+          tps[numa_id]->forward_gate_up(qlen, k, expert_ids, weights, input, output);
+        });
+  }
+
+  void forward_gate_up_binding(int qlen, int k, intptr_t expert_ids, intptr_t weights, intptr_t input,
+                               intptr_t output) {
+    forward_gate_up(qlen, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output);
+  }
+
+  // Packed gate_up-only forward for HiLLM's shard tier (states pre-grouped by
+  // expert; mask-independent -- see AMX_MOE_BASE::packed_gate_up). Supports
+  // tp_count>1: each TP part computes its column-slice of the intermediate and writes
+  // it into the full-width [rows, intermediate_size] `output` at its column offset
+  // (natural-order split). The parts touch disjoint columns, so this fans out over
+  // NUMA with no merge step -- unlike the full forward, whose down-projection runs on
+  // the CPU and is summed by merge_results. There is no merge here because the down
+  // projection runs on the GPU over the reassembled full-width intermediate.
+  void packed_gate_up(int expert_count, const int64_t* expert_indices, const int32_t* expert_counts,
+                      const void* input, void* output) {
+    if (this->weights_loaded == false) {
+      throw std::runtime_error("Not Loaded");
+    }
+    KtComputeTimer _ct(this->last_compute_ns_);
+    auto& tps = this->tps;
+    const int full_intermediate_size = this->config.intermediate_size;
+    this->config.pool->dispense_backend()->do_numa_job(
+        [&tps, expert_count, expert_indices, expert_counts, input, output, full_intermediate_size](int numa_id) {
+          tps[numa_id]->packed_gate_up(expert_count, expert_indices, expert_counts, input, output,
+                                       full_intermediate_size);
+        });
+  }
+
+  void packed_gate_up_binding(int expert_count, intptr_t expert_indices, intptr_t expert_counts, intptr_t input,
+                              intptr_t output) {
+    packed_gate_up(expert_count, (const int64_t*)expert_indices, (const int32_t*)expert_counts, (const void*)input,
+                   (void*)output);
+  }
 };
 
 #endif  // CPUINFER_OPERATOR_AMX_MOE_BASE_H

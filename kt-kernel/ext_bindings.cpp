@@ -246,6 +246,40 @@ class MOEBindings {
       return cpuinfer_interface(moe, qlen, k, expert_ids, weights, input, output, false);
     }
   };
+
+  class PackedForwardBindings {
+   public:
+    struct Args {
+      CPUInfer* cpuinfer;
+      TP_MOE<T>* moe;
+      int expert_count;
+      intptr_t expert_indices;
+      intptr_t expert_counts;
+      intptr_t weights;
+      intptr_t input;
+      intptr_t output;
+      bool incremental;
+    };
+    static void inner(void* args) {
+      Args* args_ = (Args*)args;
+      args_->cpuinfer->enqueue(&TP_MOE<T>::packed_forward_binding, args_->moe, args_->expert_count,
+                               args_->expert_indices, args_->expert_counts, args_->weights, args_->input,
+                               args_->output, args_->incremental);
+    }
+    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, int expert_count,
+                                                            intptr_t expert_indices, intptr_t expert_counts,
+                                                            intptr_t weights, intptr_t input, intptr_t output,
+                                                            bool incremental = false) {
+      Args* args =
+          new Args{nullptr, moe.get(), expert_count, expert_indices, expert_counts, weights, input, output, incremental};
+      return std::make_pair((intptr_t)&inner, (intptr_t)args);
+    }
+    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, int expert_count,
+                                                            intptr_t expert_indices, intptr_t expert_counts,
+                                                            intptr_t weights, intptr_t input, intptr_t output) {
+      return cpuinfer_interface(moe, expert_count, expert_indices, expert_counts, weights, input, output, false);
+    }
+  };
 };
 
 #if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
@@ -429,9 +463,19 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("forward_task",
            py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t, bool>(
                &MoeBindings::ForwardBindings::cpuinfer_interface))
+      .def("packed_forward_task",
+           py::overload_cast<std::shared_ptr<MoeClass>, int, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t>(
+               &MoeBindings::PackedForwardBindings::cpuinfer_interface))
+      .def("packed_forward_task",
+           py::overload_cast<std::shared_ptr<MoeClass>, int, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, bool>(
+               &MoeBindings::PackedForwardBindings::cpuinfer_interface))
       .def("warm_up", &MoeClass::warm_up)
       .def("load_weights", &MoeClass::load_weights)
-      .def("forward", &MoeClass::forward_binding);
+      .def("forward", &MoeClass::forward_binding)
+      .def("packed_forward", &MoeClass::packed_forward_binding)
+      // Pure CPU-compute time (ns) of the most recent forward task, measured on the
+      // worker thread. Used by gen_config to calibrate cpu_* as compute-only.
+      .def("last_compute_ns", &MoeClass::last_compute_ns);
 
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
@@ -476,6 +520,71 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
     moe_cls.def("write_weight_scale_to_buffer_task", &WriteWeightScaleToBufferBindings::cpuinfer_interface,
                 py::arg("gpu_tp_count"), py::arg("expert_id"), py::arg("w13_weight_ptrs"), py::arg("w13_scale_ptrs"),
                 py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
+  }
+
+  // Bind forward_gate_up_task for MoE types that support it. Used by HiLLM's
+  // shard tier: gate_up+activation on the CPU, down on the GPU.
+  if constexpr (requires { &MoeClass::forward_gate_up_binding; }) {
+    struct ForwardGateUpBindings {
+      struct Args {
+        CPUInfer* cpuinfer;
+        MoeClass* moe;
+        int qlen;
+        int k;
+        intptr_t expert_ids;
+        intptr_t weights;
+        intptr_t input;
+        intptr_t output;
+      };
+
+      static void inner(void* args) {
+        Args* a = (Args*)args;
+        a->cpuinfer->enqueue(&MoeClass::forward_gate_up_binding, a->moe, a->qlen, a->k, a->expert_ids, a->weights,
+                             a->input, a->output);
+      }
+
+      static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int qlen, int k,
+                                                              intptr_t expert_ids, intptr_t weights, intptr_t input,
+                                                              intptr_t output) {
+        Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output};
+        return std::make_pair((intptr_t)&inner, (intptr_t)args);
+      }
+    };
+
+    moe_cls.def("forward_gate_up_task", &ForwardGateUpBindings::cpuinfer_interface, py::arg("qlen"), py::arg("k"),
+                py::arg("expert_ids"), py::arg("weights"), py::arg("input"), py::arg("output"));
+  }
+
+  // Bind packed_gate_up_task: HiLLM shard tier with states pre-grouped by expert
+  // (mask-independent, no router masking). gate_up+activation on the CPU, down on GPU.
+  if constexpr (requires { &MoeClass::packed_gate_up_binding; }) {
+    struct PackedGateUpBindings {
+      struct Args {
+        CPUInfer* cpuinfer;
+        MoeClass* moe;
+        int expert_count;
+        intptr_t expert_indices;
+        intptr_t expert_counts;
+        intptr_t input;
+        intptr_t output;
+      };
+
+      static void inner(void* args) {
+        Args* a = (Args*)args;
+        a->cpuinfer->enqueue(&MoeClass::packed_gate_up_binding, a->moe, a->expert_count, a->expert_indices,
+                             a->expert_counts, a->input, a->output);
+      }
+
+      static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int expert_count,
+                                                              intptr_t expert_indices, intptr_t expert_counts,
+                                                              intptr_t input, intptr_t output) {
+        Args* args = new Args{nullptr, moe.get(), expert_count, expert_indices, expert_counts, input, output};
+        return std::make_pair((intptr_t)&inner, (intptr_t)args);
+      }
+    };
+
+    moe_cls.def("packed_gate_up_task", &PackedGateUpBindings::cpuinfer_interface, py::arg("expert_count"),
+                py::arg("expert_indices"), py::arg("expert_counts"), py::arg("input"), py::arg("output"));
   }
 }
 
@@ -730,6 +839,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, gate_projs)
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, up_projs)
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, down_projs)
+      .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, gate_biases)
+      .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, up_biases)
+      .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, down_biases)
 
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, gate_scales)
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, up_scales)
@@ -760,6 +872,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("down_type", &GeneralMOEConfig::down_type)
       .def_readwrite("hidden_type", &GeneralMOEConfig::hidden_type)
       .def_readwrite("max_cache_depth", &GeneralMOEConfig::max_cache_depth)
+      .def_readwrite("activation_type", &GeneralMOEConfig::activation_type)
       // V4-Flash 2604B SwiGLU clamp limit (0.0 = disabled). See common.hpp.
       .def_readwrite("swiglu_limit", &GeneralMOEConfig::swiglu_limit)
       .def_readwrite("swiglu_alpha", &GeneralMOEConfig::swiglu_alpha)

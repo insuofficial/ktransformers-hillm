@@ -180,6 +180,27 @@ class AVX2_MOE_BASE {
     }
   }
 
+  void forward_gate_up(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
+                       void* output) {
+    if (qlen > 1) {
+      forward_prefill(qlen, k, expert_ids, weights, input, output, /*gate_up_only=*/true);
+    } else {
+      forward_decode(k, expert_ids, weights, input, output, /*gate_up_only=*/true);
+    }
+  }
+
+  void copy_gate_up_intermediate(void* output) {
+    ggml_bf16_t* out = (ggml_bf16_t*)output;
+    const size_t I = config_.intermediate_size;
+    size_t off = 0;
+    for (int e = 0; e < config_.expert_num; e++) {
+      int n = m_local_num_[e];
+      if (n == 0) continue;
+      std::memcpy(out + off * I, m_local_gate_output_ptr_[e], (size_t)n * I * sizeof(ggml_bf16_t));
+      off += n;
+    }
+  }
+
   template <typename... Args>
   void load_weights(Args&&... args) {
     derived()->load_weights(std::forward<Args>(args)...);
@@ -191,7 +212,7 @@ class AVX2_MOE_BASE {
   }
 
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-                       void* output) {
+                       void* output, bool gate_up_only = false) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
 
     int activated_expert = 0;
@@ -301,6 +322,10 @@ class AVX2_MOE_BASE {
 
     // Activation: SiLU(gate) * up — AVX2 version (8 elements at a time)
     apply_activation(activated_expert, nth, qlen);
+    if (gate_up_only) {
+      copy_gate_up_intermediate(output);
+      return;
+    }
 
     // Pack activation output into BufferA for down projection
     pool->do_work_stealing_job(
@@ -348,7 +373,8 @@ class AVX2_MOE_BASE {
         nullptr);
   }
 
-  void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+  void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output,
+                      bool gate_up_only = false) {
     int qlen = 1;
     auto pool = config_.pool->get_subpool(tp_part_idx);
 
@@ -436,6 +462,10 @@ class AVX2_MOE_BASE {
 
     // Activation
     apply_activation(activated_expert, nth, qlen);
+    if (gate_up_only) {
+      copy_gate_up_intermediate(output);
+      return;
+    }
 
     // Pack for down projection
     pool->do_work_stealing_job(
@@ -610,6 +640,27 @@ class TP_MOE<AVX2_MOE_BASE<T, Derived>> : public TP_MOE_Common<AVX2_MOE_BASE<T, 
   }
 
   void merge_results(int qlen, void* output) override { merge_results(qlen, output, false); }
+
+  void forward_gate_up(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
+                       void* output) {
+    if (this->weights_loaded == false) {
+      throw std::runtime_error("Not Loaded");
+    }
+    if (this->tp_count != 1) {
+      throw std::runtime_error("forward_gate_up requires threadpool_count==1 (single TP part)");
+    }
+    KtComputeTimer _ct(this->last_compute_ns_);
+    auto& tps = this->tps;
+    this->config.pool->dispense_backend()->do_numa_job(
+        [&tps, qlen, k, expert_ids, weights, input, output](int numa_id) {
+          tps[numa_id]->forward_gate_up(qlen, k, expert_ids, weights, input, output);
+        });
+  }
+
+  void forward_gate_up_binding(int qlen, int k, intptr_t expert_ids, intptr_t weights, intptr_t input,
+                               intptr_t output) {
+    forward_gate_up(qlen, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output);
+  }
 };
 
 #endif  // CPUINFER_OPERATOR_AVX2_MOE_BASE_H

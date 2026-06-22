@@ -273,7 +273,11 @@ elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LWR
             list(APPEND ARCH_FLAGS -mavx2 -mfma -msse3 -mf16c)
         endif()
         if(LLAMA_AVX512)
-            list(APPEND ARCH_FLAGS -mavx512f -mavx512bw -mavx512dq -mfma -mf16c -msse3)
+            # -mavx512vl is required for masked 256-bit ops (e.g. _mm256_maskz_loadu_epi16
+            # in ext_bindings bf16 paths). Every AVX512 CPU (Skylake-X+) has VL, and the
+            # NATIVE build gets it via -march=native; add it here so the portable AVX512
+            # variants (multi-variant build) compile too.
+            list(APPEND ARCH_FLAGS -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma -mf16c -msse3)
         endif()
         if(LLAMA_AVX512_VBMI)
             list(APPEND ARCH_FLAGS -mavx512vbmi)
