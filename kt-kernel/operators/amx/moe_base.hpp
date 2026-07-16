@@ -179,26 +179,54 @@ class AMX_MOE_BASE {
   // are ignored here (applied by the caller after down). Reuses the standard
   // forward_prefill/forward_decode prefix, so the intermediate is identical to
   // what the CPU tier would feed into down (incl. any gate/up bias + gpt-oss act).
+  // `skip_mask`, when given, is the caller's OWN expert_num-long mask (1 = skip) and
+  // replaces config_.gpu_experts_mask as the gather predicate. That lets a tier select
+  // its experts without touching the shared config mask, which the CPU tier owns -- so
+  // e.g. the shard tier (gate_up-only) and the CPU tier (full forward) can select
+  // disjoint experts in the same layer. nullptr -> the shared config mask.
+  inline bool skip_expert_(int64_t expert_id, const uint8_t* skip_mask) const {
+    if (skip_mask == nullptr) return config_.should_skip_expert(expert_id);
+    return expert_id < 0 || expert_id >= config_.expert_num || skip_mask[expert_id];
+  }
+
+  // `full_intermediate_size` is the intermediate width ACROSS all TP parts (this part's
+  // own width is config_.intermediate_size); see copy_gate_up_intermediate.
   void forward_gate_up(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-                       void* output) {
+                       void* output, int full_intermediate_size, const uint8_t* skip_mask) {
     if (qlen > 1) {
-      forward_prefill(qlen, k, expert_ids, weights, input, output, /*gate_up_only=*/true);
+      forward_prefill(qlen, k, expert_ids, weights, input, output, /*gate_up_only=*/true, full_intermediate_size,
+                      skip_mask);
     } else {
-      forward_decode(k, expert_ids, weights, input, output, /*gate_up_only=*/true);
+      forward_decode(k, expert_ids, weights, input, output, /*gate_up_only=*/true, full_intermediate_size, skip_mask);
     }
   }
 
-  // Copy the post-activation intermediate of every activated expert into `output`
-  // as bf16, contiguous and ordered by ascending expert id (tokens within an
-  // expert keep kt's packed order, which matches HiLLM's stable-argsort packing).
-  void copy_gate_up_intermediate(void* output) {
+  // Copy the post-activation intermediate of every activated expert into `output` as
+  // bf16, ordered by ascending expert id (tokens within an expert keep kt's packed
+  // order, which matches HiLLM's stable-argsort packing). `full_intermediate_size` is
+  // the width across ALL TP parts: this part writes its own [count, I_local] block at
+  // its column offset, so the parts fill disjoint columns of the one [rows, full]
+  // buffer with no merge step -- the down projection runs on the GPU over the
+  // reassembled full-width intermediate. tp_count==1 (full == I_local) keeps the
+  // single contiguous memcpy.
+  void copy_gate_up_intermediate(void* output, int full_intermediate_size) {
     ggml_bf16_t* out = (ggml_bf16_t*)output;
-    const size_t I = config_.intermediate_size;
+    const size_t i_local = config_.intermediate_size;
+    const size_t full = (size_t)full_intermediate_size;
+    const size_t col_offset = (size_t)tp_part_idx * i_local;
     size_t off = 0;
     for (int e = 0; e < config_.expert_num; e++) {
       int n = m_local_num_[e];
       if (n == 0) continue;
-      std::memcpy(out + off * I, m_local_gate_output_ptr_[e], (size_t)n * I * sizeof(ggml_bf16_t));
+      const ggml_bf16_t* src = m_local_gate_output_ptr_[e];
+      if (full == i_local) {
+        std::memcpy(out + off * i_local, src, (size_t)n * i_local * sizeof(ggml_bf16_t));
+      } else {
+        ggml_bf16_t* dst = out + off * full + col_offset;
+        for (int r = 0; r < n; r++) {
+          std::memcpy(dst + (size_t)r * full, src + (size_t)r * i_local, i_local * sizeof(ggml_bf16_t));
+        }
+      }
       off += n;
     }
   }
@@ -214,7 +242,8 @@ class AMX_MOE_BASE {
   }
 
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-                       void* output, bool gate_up_only = false) {
+                       void* output, bool gate_up_only = false, int full_intermediate_size = 0,
+                       const uint8_t* skip_mask = nullptr) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
 #ifdef FORWARD_TIME_PROFILE
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -228,7 +257,7 @@ class AMX_MOE_BASE {
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < qlen; i++) {
       for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[i * k + j])) {
+        if (skip_expert_(expert_ids[i * k + j], skip_mask)) {
           continue;
         }
         m_local_pos_[i][j] = m_local_num_[expert_ids[i * k + j]]++;
@@ -329,7 +358,7 @@ class AMX_MOE_BASE {
 
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[i * k + j])) {
+        if (skip_expert_(expert_ids[i * k + j], skip_mask)) {
           continue;
         }
         memcpy(m_local_input_ptr_[expert_ids[i * k + j]] + m_local_pos_[i][j] * config_.hidden_size,
@@ -397,7 +426,7 @@ class AMX_MOE_BASE {
     // HiLLM shard tier: stop after gate_up+activation and hand the packed
     // intermediate back to the caller (which runs down on the GPU).
     if (gate_up_only) {
-      copy_gate_up_intermediate(output);
+      copy_gate_up_intermediate(output, full_intermediate_size);
       return;
     }
 
@@ -438,12 +467,12 @@ class AMX_MOE_BASE {
 
     pool->do_work_stealing_job(
         qlen, nullptr,
-        [this, output, k, expert_ids, weights](int i) {
+        [this, output, k, expert_ids, weights, skip_mask](int i) {
           for (int e = 0; e < config_.hidden_size; e += 32) {
             __m512 x0 = _mm512_setzero_ps();
             __m512 x1 = _mm512_setzero_ps();
             for (int j = 0; j < k; j++) {
-              if (config_.should_skip_expert(expert_ids[i * k + j])) {
+              if (skip_expert_(expert_ids[i * k + j], skip_mask)) {
                 continue;
               }
               __m512 weight = _mm512_set1_ps(weights[i * k + j]);
@@ -644,157 +673,10 @@ class AMX_MOE_BASE {
     });
   }
 
-  // Packed gate_up for HiLLM's shard tier. Like forward_packed, the hidden states
-  // are ALREADY grouped by expert (expert_indices[i] gets expert_counts[i]
-  // contiguous rows of `input`), so there is no token scan and no gather. Unlike
-  // forward_packed it deliberately does NOT consult should_skip_expert /
-  // gpu_experts_mask -- it processes exactly the experts it is given. That makes it
-  // immune to the per-step mask the CPU tier flips (set_cpu_experts), so cpu (mask)
-  // and shard (explicit experts) can run in the same layer. Stops after
-  // gate_up+activation and writes the packed intermediate [sum(counts),
-  // full_intermediate_size] bf16 to `output` (ordered to match `input`); the caller
-  // runs the down projection on the GPU.
-  //
-  // This TP part owns intermediate columns [tp_part_idx*I_local, (tp_part_idx+1)*
-  // I_local) of the natural-order split (config_.intermediate_size == I_local; see
-  // TP_MOE::load_weights). It writes ITS column-slice into the shared full-width
-  // [rows, full_intermediate_size] `output` at that column offset, with a row stride
-  // of full_intermediate_size. With tp_count>1 the parts touch disjoint columns of
-  // the same buffer, so the outer dispatcher can fan this out over NUMA with no merge
-  // step. For tp_count==1 (full_intermediate_size == I_local) it degenerates to the
-  // old contiguous write.
-  void packed_gate_up(int expert_count, const int64_t* expert_indices, const int32_t* expert_counts,
-                      const void* input, void* output, int full_intermediate_size) {
-    auto pool = config_.pool->get_subpool(tp_part_idx);
-
-    std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
-
-    int activated_expert = 0;
-    int rows = 0;
-    for (int i = 0; i < expert_count; i++) {
-      int expert_idx = (int)expert_indices[i];
-      int count = expert_counts[i];
-      if (count == 0) {
-        continue;
-      }
-      if (count < 0 || expert_idx < 0 || expert_idx >= config_.expert_num) [[unlikely]] {
-        throw std::runtime_error("packed_gate_up received an invalid expert index/count.");
-      }
-      m_expert_id_map_[activated_expert++] = expert_idx;
-      m_local_num_[expert_idx] = count;
-      m_packed_offset_[expert_idx] = rows;
-      m_local_input_ptr_[expert_idx] = (ggml_bf16_t*)input + (size_t)rows * config_.hidden_size;
-      rows += count;
-    }
-
-    if (activated_expert == 0) {
-      return;
-    }
-
-    size_t offset = 0;
-    void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
-    void* gate_bc_pool_ptr = gate_bc_pool_;
-    void* up_bc_pool_ptr = up_bc_pool_;
-    constexpr size_t M_STEP = T::M_STEP;
-    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
-    size_t used_pool_m = 0;
-    size_t used_pool_bytes_a = 0, used_pool_bytes_bc_gate = 0, used_pool_bytes_bc_up = 0;
-
-    for (int task_id = 0; task_id < activated_expert; task_id++) {
-      int expert_idx = m_expert_id_map_[task_id];
-      int count = m_local_num_[expert_idx];
-
-      m_local_gate_output_ptr_[expert_idx] = m_local_gate_output_ + offset * config_.intermediate_size;
-      m_local_up_output_ptr_[expert_idx] = m_local_up_output_ + offset * config_.intermediate_size;
-      offset += count;
-
-      size_t max_m = (count + M_STEP - 1) / M_STEP * M_STEP;
-      gate_up_ba_[expert_idx]->max_m = max_m;
-      gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
-      size_t ba_size = align64(buffer_a_required_size(max_m, config_.hidden_size));
-      gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
-
-      gate_bc_[expert_idx]->max_m = max_m;
-      gate_bc_[expert_idx]->set_data(gate_bc_pool_ptr);
-      size_t bc_gate_size = align64(buffer_c_required_size(max_m, config_.intermediate_size));
-      gate_bc_pool_ptr = (void*)((uintptr_t)gate_bc_pool_ptr + bc_gate_size);
-
-      up_bc_[expert_idx]->max_m = max_m;
-      up_bc_[expert_idx]->set_data(up_bc_pool_ptr);
-      size_t bc_up_size = align64(buffer_c_required_size(max_m, config_.intermediate_size));
-      up_bc_pool_ptr = (void*)((uintptr_t)up_bc_pool_ptr + bc_up_size);
-
-      used_pool_m += max_m;
-      used_pool_bytes_a += ba_size;
-      used_pool_bytes_bc_gate += bc_gate_size;
-      used_pool_bytes_bc_up += bc_up_size;
-    }
-
-    assert(used_pool_m <= pool_count_);
-    assert(used_pool_bytes_a <= gate_up_ba_pool_bytes_);
-    assert(used_pool_bytes_bc_gate <= gate_bc_pool_bytes_);
-    assert(used_pool_bytes_bc_up <= up_bc_pool_bytes_);
-
-    auto direct_or_pool = [&](int count, auto&& fn) {
-      if (rows < 10) {
-        for (int i = 0; i < count; i++) {
-          fn(i);
-        }
-      } else {
-        pool->do_work_stealing_job(count, nullptr, fn, nullptr);
-      }
-    };
-
-    direct_or_pool(activated_expert, [this](int task_id) {
-      int expert_idx = m_expert_id_map_[task_id];
-      gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
-    });
-
-    int nth = T::recommended_nth(config_.intermediate_size);
-    pool->do_work_stealing_job(
-        nth * activated_expert * 2, [](int _) { T::config(); },
-        [this, nth](int task_id2) {
-          int task_id = task_id2 / 2;
-          bool do_up = task_id2 % 2;
-          int expert_idx = m_expert_id_map_[task_id / nth];
-
-          int ith = task_id % nth;
-          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, m_local_num_[expert_idx]);
-          if (do_up) {
-            up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
-          } else {
-            gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith, nth);
-          }
-        },
-        nullptr);
-
-    apply_activation(activated_expert, nth, rows);
-
-    // Write the packed post-activation intermediate (bf16) into the full-width
-    // [rows, full_intermediate_size] output -- one [count, I_local] block per expert
-    // at its row offset, placed at this TP part's column offset. Each row is copied
-    // separately because dst rows are full_intermediate_size apart while src rows are
-    // I_local apart; the single contiguous memcpy is recovered when they are equal
-    // (tp_count==1).
-    const int i_local = config_.intermediate_size;
-    const size_t col_offset = (size_t)tp_part_idx * (size_t)i_local;
-    direct_or_pool(activated_expert,
-                   [this, output, full_intermediate_size, i_local, col_offset](int task_id) {
-                     int expert_idx = m_expert_id_map_[task_id];
-                     int count = m_local_num_[expert_idx];
-                     size_t row_offset = (size_t)m_packed_offset_[expert_idx];
-                     const ggml_bf16_t* src = m_local_gate_output_ptr_[expert_idx];
-                     ggml_bf16_t* dst =
-                         (ggml_bf16_t*)output + row_offset * (size_t)full_intermediate_size + col_offset;
-                     for (int r = 0; r < count; r++) {
-                       std::memcpy(dst + (size_t)r * (size_t)full_intermediate_size,
-                                   src + (size_t)r * (size_t)i_local, (size_t)i_local * sizeof(ggml_bf16_t));
-                     }
-                   });
-  }
 
   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output,
-                      bool gate_up_only = false) {
+                      bool gate_up_only = false, int full_intermediate_size = 0,
+                      const uint8_t* skip_mask = nullptr) {
     int qlen = 1;
     auto pool = config_.pool->get_subpool(tp_part_idx);
 #ifdef FORWARD_TIME_PROFILE
@@ -806,7 +688,7 @@ class AMX_MOE_BASE {
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < k; i++) {
-      if (config_.should_skip_expert(expert_ids[i])) {
+      if (skip_expert_(expert_ids[i], skip_mask)) {
         continue;
       }
       m_expert_id_map_[activated_expert] = expert_ids[i];
@@ -926,7 +808,7 @@ class AMX_MOE_BASE {
 
     // HiLLM shard tier: stop after gate_up+activation (see forward_prefill).
     if (gate_up_only) {
-      copy_gate_up_intermediate(output);
+      copy_gate_up_intermediate(output, full_intermediate_size);
       return;
     }
 
@@ -969,7 +851,7 @@ class AMX_MOE_BASE {
       __m512 x0 = _mm512_setzero_ps();
       __m512 x1 = _mm512_setzero_ps();
       for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[j])) {
+        if (skip_expert_(expert_ids[j], skip_mask)) {
           continue;
         }
         __m512 weight = _mm512_set1_ps(weights[j]);
@@ -1178,42 +1060,23 @@ class TP_MOE<AMX_MOE_BASE<T, Derived>> : public TP_MOE_Common<AMX_MOE_BASE<T, De
 
   void merge_results(int qlen, void* output) override { merge_results(qlen, output, false); }
 
-  // gate_up-only forward for HiLLM's shard tier. Computes silu(gate)*up (or the
-  // gpt-oss activation) on the CPU (AMX) for the masked experts and writes the
-  // packed intermediate [total_tokens, intermediate_size] bf16 into `output`; the
-  // caller runs the down projection on the GPU. Single TP part only
-  // (threadpool_count==1) so the intermediate is not split across NUMA nodes.
+  // gate_up-only forward for HiLLM's shard tier. Gathers the routed tokens of the
+  // selected experts, computes silu(gate)*up (or the gpt-oss activation) on the CPU
+  // (AMX), and writes the packed intermediate [total_tokens, intermediate_size] bf16
+  // into `output`; the caller runs the down projection on the GPU.
+  //
+  // `skip_mask` (expert_num long, 1 = skip) selects the experts INSTEAD of the shared
+  // config.gpu_experts_mask, so this tier and the CPU tier (which owns that mask) can
+  // select disjoint experts in the same layer. nullptr -> the shared config mask.
+  //
+  // Supports tp_count>1: each TP part computes its column-slice of the intermediate and
+  // writes it into the full-width `output` at its column offset (natural-order split).
+  // The parts touch disjoint columns, so this fans out over NUMA with no merge step --
+  // unlike the full forward, whose down projection runs on the CPU and is summed by
+  // merge_results. There is no merge here because the down projection runs on the GPU
+  // over the reassembled full-width intermediate.
   void forward_gate_up(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-                       void* output) {
-    if (this->weights_loaded == false) {
-      throw std::runtime_error("Not Loaded");
-    }
-    if (this->tp_count != 1) {
-      throw std::runtime_error("forward_gate_up requires threadpool_count==1 (single TP part)");
-    }
-    KtComputeTimer _ct(this->last_compute_ns_);
-    auto& tps = this->tps;
-    this->config.pool->dispense_backend()->do_numa_job(
-        [&tps, qlen, k, expert_ids, weights, input, output](int numa_id) {
-          tps[numa_id]->forward_gate_up(qlen, k, expert_ids, weights, input, output);
-        });
-  }
-
-  void forward_gate_up_binding(int qlen, int k, intptr_t expert_ids, intptr_t weights, intptr_t input,
-                               intptr_t output) {
-    forward_gate_up(qlen, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output);
-  }
-
-  // Packed gate_up-only forward for HiLLM's shard tier (states pre-grouped by
-  // expert; mask-independent -- see AMX_MOE_BASE::packed_gate_up). Supports
-  // tp_count>1: each TP part computes its column-slice of the intermediate and writes
-  // it into the full-width [rows, intermediate_size] `output` at its column offset
-  // (natural-order split). The parts touch disjoint columns, so this fans out over
-  // NUMA with no merge step -- unlike the full forward, whose down-projection runs on
-  // the CPU and is summed by merge_results. There is no merge here because the down
-  // projection runs on the GPU over the reassembled full-width intermediate.
-  void packed_gate_up(int expert_count, const int64_t* expert_indices, const int32_t* expert_counts,
-                      const void* input, void* output) {
+                       void* output, const uint8_t* skip_mask) {
     if (this->weights_loaded == false) {
       throw std::runtime_error("Not Loaded");
     }
@@ -1221,16 +1084,16 @@ class TP_MOE<AMX_MOE_BASE<T, Derived>> : public TP_MOE_Common<AMX_MOE_BASE<T, De
     auto& tps = this->tps;
     const int full_intermediate_size = this->config.intermediate_size;
     this->config.pool->dispense_backend()->do_numa_job(
-        [&tps, expert_count, expert_indices, expert_counts, input, output, full_intermediate_size](int numa_id) {
-          tps[numa_id]->packed_gate_up(expert_count, expert_indices, expert_counts, input, output,
-                                       full_intermediate_size);
+        [&tps, qlen, k, expert_ids, weights, input, output, full_intermediate_size, skip_mask](int numa_id) {
+          tps[numa_id]->forward_gate_up(qlen, k, expert_ids, weights, input, output, full_intermediate_size,
+                                        skip_mask);
         });
   }
 
-  void packed_gate_up_binding(int expert_count, intptr_t expert_indices, intptr_t expert_counts, intptr_t input,
-                              intptr_t output) {
-    packed_gate_up(expert_count, (const int64_t*)expert_indices, (const int32_t*)expert_counts, (const void*)input,
-                   (void*)output);
+  void forward_gate_up_binding(int qlen, int k, intptr_t expert_ids, intptr_t weights, intptr_t input,
+                               intptr_t output, intptr_t skip_mask) {
+    forward_gate_up(qlen, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output,
+                    (const uint8_t*)skip_mask);
   }
 };
 

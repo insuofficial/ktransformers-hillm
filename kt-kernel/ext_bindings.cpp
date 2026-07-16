@@ -228,16 +228,33 @@ class MOEBindings {
       intptr_t input;
       intptr_t output;
       bool incremental;
+      // OPTIONAL (nullptr -> skip). Points at the caller's pinned CPU-tier mask, already in
+      // gpu_experts_mask format and expert_num long (so no count travels with it). Read at
+      // forward time (per graph replay), so the CPU-tier selection is fully dynamic under
+      // capture -- the scheduler host node rewrites that buffer before this node runs.
+      const uint8_t* cpu_mask;
     };
     static void inner(void* args) {
       Args* args_ = (Args*)args;
+      // Adopt the CPU-tier mask HERE (in the forward host node, before dispatch) in place
+      // of a host-side set_cpu_experts on the Python wrapper -- the worker threads then
+      // read the fresh gpu_experts_mask. Capturable (this runs as a cudaLaunchHostFunc);
+      // the mask is read from the pinned buffer so it varies per replay.
+      if (args_->cpu_mask) args_->moe->config.set_cpu_mask(args_->cpu_mask);
       args_->cpuinfer->enqueue(&TP_MOE<T>::forward_binding, args_->moe, args_->qlen, args_->k, args_->expert_ids,
                                args_->weights, args_->input, args_->output, args_->incremental);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
+                                                            intptr_t output, bool incremental, intptr_t cpu_mask) {
+      Args* args = new Args{nullptr,     moe.get(), qlen,  k,      expert_ids,
+                            weights,     input,     output, incremental, (const uint8_t*)cpu_mask};
+      return std::make_pair((intptr_t)&inner, (intptr_t)args);
+    }
+    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
+                                                            intptr_t expert_ids, intptr_t weights, intptr_t input,
                                                             intptr_t output, bool incremental = false) {
-      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental};
+      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental, nullptr};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
@@ -463,6 +480,9 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("forward_task",
            py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t, bool>(
                &MoeBindings::ForwardBindings::cpuinfer_interface))
+      .def("forward_task",  // + cpu_mask ptr: adopts the CPU-tier mask in-node (capturable)
+           py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t, bool,
+                             intptr_t>(&MoeBindings::ForwardBindings::cpuinfer_interface))
       .def("packed_forward_task",
            py::overload_cast<std::shared_ptr<MoeClass>, int, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t>(
                &MoeBindings::PackedForwardBindings::cpuinfer_interface))
@@ -522,10 +542,14 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                 py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
   }
 
-  // Bind forward_gate_up_task for MoE types that support it. Used by HiLLM's
-  // shard tier: gate_up+activation on the CPU, down on the GPU.
+  // Bind gate_up_task for MoE types that support it. HiLLM's shard tier: gate_up +
+  // activation on the CPU, down on the GPU. Takes the SAME (hidden_states, routing)
+  // inputs as forward_task -- kt gathers/packs the selected tokens itself -- plus
+  // `skip_mask`, the tier's own expert_num-long mask (1 = skip) so it selects experts
+  // without touching config.gpu_experts_mask (which the CPU tier owns). The mask is
+  // read at forward time, so the selection is graph-capturable.
   if constexpr (requires { &MoeClass::forward_gate_up_binding; }) {
-    struct ForwardGateUpBindings {
+    struct GateUpBindings {
       struct Args {
         CPUInfer* cpuinfer;
         MoeClass* moe;
@@ -535,56 +559,26 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
         intptr_t weights;
         intptr_t input;
         intptr_t output;
+        intptr_t skip_mask;
       };
 
       static void inner(void* args) {
         Args* a = (Args*)args;
         a->cpuinfer->enqueue(&MoeClass::forward_gate_up_binding, a->moe, a->qlen, a->k, a->expert_ids, a->weights,
-                             a->input, a->output);
+                             a->input, a->output, a->skip_mask);
       }
 
       static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int qlen, int k,
                                                               intptr_t expert_ids, intptr_t weights, intptr_t input,
-                                                              intptr_t output) {
-        Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output};
+                                                              intptr_t output, intptr_t skip_mask) {
+        Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, skip_mask};
         return std::make_pair((intptr_t)&inner, (intptr_t)args);
       }
     };
 
-    moe_cls.def("forward_gate_up_task", &ForwardGateUpBindings::cpuinfer_interface, py::arg("qlen"), py::arg("k"),
-                py::arg("expert_ids"), py::arg("weights"), py::arg("input"), py::arg("output"));
-  }
-
-  // Bind packed_gate_up_task: HiLLM shard tier with states pre-grouped by expert
-  // (mask-independent, no router masking). gate_up+activation on the CPU, down on GPU.
-  if constexpr (requires { &MoeClass::packed_gate_up_binding; }) {
-    struct PackedGateUpBindings {
-      struct Args {
-        CPUInfer* cpuinfer;
-        MoeClass* moe;
-        int expert_count;
-        intptr_t expert_indices;
-        intptr_t expert_counts;
-        intptr_t input;
-        intptr_t output;
-      };
-
-      static void inner(void* args) {
-        Args* a = (Args*)args;
-        a->cpuinfer->enqueue(&MoeClass::packed_gate_up_binding, a->moe, a->expert_count, a->expert_indices,
-                             a->expert_counts, a->input, a->output);
-      }
-
-      static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int expert_count,
-                                                              intptr_t expert_indices, intptr_t expert_counts,
-                                                              intptr_t input, intptr_t output) {
-        Args* args = new Args{nullptr, moe.get(), expert_count, expert_indices, expert_counts, input, output};
-        return std::make_pair((intptr_t)&inner, (intptr_t)args);
-      }
-    };
-
-    moe_cls.def("packed_gate_up_task", &PackedGateUpBindings::cpuinfer_interface, py::arg("expert_count"),
-                py::arg("expert_indices"), py::arg("expert_counts"), py::arg("input"), py::arg("output"));
+    moe_cls.def("gate_up_task", &GateUpBindings::cpuinfer_interface, py::arg("qlen"), py::arg("k"),
+                py::arg("expert_ids"), py::arg("weights"), py::arg("input"), py::arg("output"),
+                py::arg("skip_mask"));
   }
 }
 

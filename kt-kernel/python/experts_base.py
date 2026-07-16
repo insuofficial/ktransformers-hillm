@@ -384,25 +384,15 @@ class BaseMoEWrapper(_MoEBase, ABC):
 
         return immediate_ids, deferred_ids
 
-    def submit_forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        cuda_stream,
-    ):
-        """
-        Submit forward inference task to CPU (non-blocking).
+    def stage_inputs(self, hidden_states: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor):
+        """D2H this layer's hidden states + routing into the shared pinned slot buffers.
 
-        Args:
-            hidden_states: Input hidden states [batch_size, hidden_size]
-            topk_ids: Top-k expert IDs [batch_size, num_experts_per_tok]
-            topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
-            cuda_stream: CUDA stream for synchronization
-        """
+        kt itself never copies -- its tasks take raw HOST pointers -- so this is where the
+        inputs land. submit_forward (CPU tier) and submit_gate_up (shard tier) read the
+        IDENTICAL inputs, so a caller running both should stage once and hand the returned
+        handle to each, instead of letting them each repeat the D2H. Returns the slot bundle
+        the two submits consume."""
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        batch_size = flat_hidden_states.shape[0]
-
         (
             input_tensor_cpu,
             immediate_experts_ids_cpu,
@@ -412,18 +402,13 @@ class BaseMoEWrapper(_MoEBase, ABC):
             bsz_tensor_cpu,
             _output_gpu,
         ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
-
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
-        next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
-
-        bsz_slot_tensor = bsz_tensor_cpu[current_slot]
 
         topk_ids_long = topk_ids.to(torch.long)
         immediate_ids: torch.Tensor
         deferred_ids: Optional[torch.Tensor]
         if self.max_deferred_experts_per_token > 0:
             protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
-
             immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
         else:
             immediate_ids = topk_ids_long
@@ -433,19 +418,125 @@ class BaseMoEWrapper(_MoEBase, ABC):
         weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
         immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
 
-        incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
-        self.cpu_infer.submit_with_cuda_stream(
-            cuda_stream,
-            self.moe.forward_task(
-                bsz_slot_tensor.data_ptr(),
-                immediate_experts_ids_cpu[current_slot].size(-1),
-                immediate_experts_ids_cpu[current_slot].data_ptr(),
-                weights_cpu[current_slot].data_ptr(),
-                input_tensor_cpu[current_slot].data_ptr(),
-                output_cpu[current_slot].data_ptr(),
-                incremental,
-            ),
+        return (
+            input_tensor_cpu,
+            immediate_experts_ids_cpu,
+            deferred_experts_ids_cpu,
+            weights_cpu,
+            output_cpu,
+            bsz_tensor_cpu,
+            current_slot,
+            deferred_ids,
         )
+
+    def submit_gate_up(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        cuda_stream,
+        mask,
+        output: torch.Tensor,
+        staged=None,
+    ):
+        """Submit a gate_up-only task to CPU (non-blocking) -- HiLLM's shard tier.
+
+        Same inputs as submit_forward: kt gathers the routed tokens of the selected experts
+        itself, runs gate/up + activation, and writes the packed intermediate
+        [total_tokens, intermediate_size] bf16 into `output` (ordered by ascending expert id;
+        tokens within an expert keep the routing order). The down projection is the caller's
+        to run on the GPU.
+
+        `mask` is this tier's own pinned uint8 [num_experts] expert mask (1 = skip). kt reads
+        it AT FORWARD TIME instead of consulting its shared gpu_experts_mask, so the shard
+        and CPU tiers select disjoint experts without contending -- and the selection is
+        graph-capturable. `staged` reuses a previous stage_inputs() (see submit_forward).
+        """
+        if staged is None:
+            staged = self.stage_inputs(hidden_states, topk_ids, topk_weights)
+        (
+            input_tensor_cpu,
+            immediate_experts_ids_cpu,
+            _deferred_experts_ids_cpu,
+            weights_cpu,
+            _output_cpu,
+            _bsz_tensor_cpu,
+            current_slot,
+            _deferred_ids,
+        ) = staged
+
+        ids = immediate_experts_ids_cpu[current_slot]
+        task = self.moe.gate_up_task(
+            ids.size(0),          # qlen
+            ids.size(-1),         # k
+            ids.data_ptr(),
+            weights_cpu[current_slot].data_ptr(),
+            input_tensor_cpu[current_slot].data_ptr(),
+            output.data_ptr(),
+            mask.data_ptr(),      # only here, at the native boundary, does a tensor become an address
+        )
+        self.cpu_infer.submit_with_cuda_stream(cuda_stream, task)
+
+    def submit_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        cuda_stream,
+        mask=None,
+        staged=None,
+    ):
+        """
+        Submit forward inference task to CPU (non-blocking).
+
+        Args:
+            hidden_states: Input hidden states [batch_size, hidden_size]
+            topk_ids: Top-k expert IDs [batch_size, num_experts_per_tok]
+            topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
+            cuda_stream: CUDA stream for synchronization
+            mask: OPTIONAL pinned uint8 [num_experts] CPU-tier mask tensor, already in
+                gpu_experts_mask format (1 = skip, 0 = compute on the CPU tier) -- e.g. the
+                scheduler host node's pinned output. Fixed length, so no count travels with
+                it. When given, the forward host node adopts it (memcpy into
+                gpu_experts_mask) instead of a host-side mask flip; it is read at forward
+                time, so the selection is capturable.
+            staged: OPTIONAL handle from a previous stage_inputs() for this same layer/step
+                -- reuses that D2H instead of repeating it (see stage_inputs).
+        """
+        if staged is None:
+            staged = self.stage_inputs(hidden_states, topk_ids, topk_weights)
+        (
+            input_tensor_cpu,
+            immediate_experts_ids_cpu,
+            deferred_experts_ids_cpu,
+            weights_cpu,
+            output_cpu,
+            bsz_tensor_cpu,
+            current_slot,
+            deferred_ids,
+        ) = staged
+
+        next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
+        bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+
+        incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        args = (
+            bsz_slot_tensor.data_ptr(),
+            immediate_experts_ids_cpu[current_slot].size(-1),
+            immediate_experts_ids_cpu[current_slot].data_ptr(),
+            weights_cpu[current_slot].data_ptr(),
+            input_tensor_cpu[current_slot].data_ptr(),
+            output_cpu[current_slot].data_ptr(),
+            incremental,
+        )
+        if mask is not None:
+            # The forward host node adopts the caller's pinned CPU-tier mask (capturable) --
+            # no host-side mask flip. Only here, at the native boundary, does the tensor
+            # become a raw address.
+            task = self.moe.forward_task(*args, mask.data_ptr())
+        else:
+            task = self.moe.forward_task(*args)
+        self.cpu_infer.submit_with_cuda_stream(cuda_stream, task)
 
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         if deferred_ids is not None:

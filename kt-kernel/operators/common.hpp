@@ -275,6 +275,18 @@ struct GeneralMOEConfig {
     return expert_id < 0 || expert_id >= expert_num || (gpu_experts_mask && gpu_experts_mask[expert_id]);
   }
 
+  // Adopt the CPU-tier selection published by the caller: `mask` is already in this
+  // struct's own gpu_experts_mask format (1 = skip, 0 = compute on the CPU tier) and is
+  // always `expert_num` long, so no count is needed. Lets kt's forward host node set the
+  // selection itself, reading the caller's pinned buffer AT FORWARD TIME -- which is what
+  // makes the CPU-tier mask graph-capturable (the scheduler host node rewrites that buffer
+  // on every replay). Replaces a host-side set_cpu_experts on the Python wrapper.
+  inline void set_cpu_mask(const uint8_t* mask) {
+    if (!gpu_experts_mask) return;
+    std::memcpy(gpu_experts_mask, mask, static_cast<size_t>(expert_num));
+    compute_num_gpu_experts();
+  }
+
   void* gate_proj = nullptr;
   void* up_proj = nullptr;
   void* down_proj = nullptr;

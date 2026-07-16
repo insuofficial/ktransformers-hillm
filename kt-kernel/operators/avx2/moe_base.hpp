@@ -180,23 +180,54 @@ class AVX2_MOE_BASE {
     }
   }
 
+  // `skip_mask`, when given, is the caller's OWN expert_num-long mask (1 = skip) and
+  // replaces config_.gpu_experts_mask as the gather predicate. That lets a tier select
+  // its experts without touching the shared config mask, which the CPU tier owns -- so
+  // e.g. the shard tier (gate_up-only) and the CPU tier (full forward) can select
+  // disjoint experts in the same layer. nullptr -> the shared config mask.
+  inline bool skip_expert_(int64_t expert_id, const uint8_t* skip_mask) const {
+    if (skip_mask == nullptr) return config_.should_skip_expert(expert_id);
+    return expert_id < 0 || expert_id >= config_.expert_num || skip_mask[expert_id];
+  }
+
+  // `full_intermediate_size` is the intermediate width ACROSS all TP parts (this part's
+  // own width is config_.intermediate_size); see copy_gate_up_intermediate.
   void forward_gate_up(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-                       void* output) {
+                       void* output, int full_intermediate_size, const uint8_t* skip_mask) {
     if (qlen > 1) {
-      forward_prefill(qlen, k, expert_ids, weights, input, output, /*gate_up_only=*/true);
+      forward_prefill(qlen, k, expert_ids, weights, input, output, /*gate_up_only=*/true, full_intermediate_size,
+                      skip_mask);
     } else {
-      forward_decode(k, expert_ids, weights, input, output, /*gate_up_only=*/true);
+      forward_decode(k, expert_ids, weights, input, output, /*gate_up_only=*/true, full_intermediate_size, skip_mask);
     }
   }
 
-  void copy_gate_up_intermediate(void* output) {
+  // Copy the post-activation intermediate of every activated expert into `output` as
+  // bf16, ordered by ascending expert id (tokens within an expert keep kt's packed
+  // order, which matches HiLLM's stable-argsort packing). `full_intermediate_size` is
+  // the width across ALL TP parts: this part writes its own [count, I_local] block at
+  // its column offset, so the parts fill disjoint columns of the one [rows, full]
+  // buffer with no merge step -- the down projection runs on the GPU over the
+  // reassembled full-width intermediate. tp_count==1 (full == I_local) keeps the
+  // single contiguous memcpy.
+  void copy_gate_up_intermediate(void* output, int full_intermediate_size) {
     ggml_bf16_t* out = (ggml_bf16_t*)output;
-    const size_t I = config_.intermediate_size;
+    const size_t i_local = config_.intermediate_size;
+    const size_t full = (size_t)full_intermediate_size;
+    const size_t col_offset = (size_t)tp_part_idx * i_local;
     size_t off = 0;
     for (int e = 0; e < config_.expert_num; e++) {
       int n = m_local_num_[e];
       if (n == 0) continue;
-      std::memcpy(out + off * I, m_local_gate_output_ptr_[e], (size_t)n * I * sizeof(ggml_bf16_t));
+      const ggml_bf16_t* src = m_local_gate_output_ptr_[e];
+      if (full == i_local) {
+        std::memcpy(out + off * i_local, src, (size_t)n * i_local * sizeof(ggml_bf16_t));
+      } else {
+        ggml_bf16_t* dst = out + off * full + col_offset;
+        for (int r = 0; r < n; r++) {
+          std::memcpy(dst + (size_t)r * full, src + (size_t)r * i_local, i_local * sizeof(ggml_bf16_t));
+        }
+      }
       off += n;
     }
   }
@@ -212,14 +243,15 @@ class AVX2_MOE_BASE {
   }
 
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-                       void* output, bool gate_up_only = false) {
+                       void* output, bool gate_up_only = false, int full_intermediate_size = 0,
+                       const uint8_t* skip_mask = nullptr) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
 
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < qlen; i++) {
       for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[i * k + j])) {
+        if (skip_expert_(expert_ids[i * k + j], skip_mask)) {
           continue;
         }
         m_local_pos_[i][j] = m_local_num_[expert_ids[i * k + j]]++;
@@ -290,7 +322,7 @@ class AVX2_MOE_BASE {
     // Copy input to per-expert buffers
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
+        if (skip_expert_(expert_ids[i * k + j], skip_mask)) continue;
         memcpy(m_local_input_ptr_[expert_ids[i * k + j]] + m_local_pos_[i][j] * config_.hidden_size,
                (ggml_bf16_t*)input + i * config_.hidden_size, sizeof(ggml_bf16_t) * config_.hidden_size);
       }
@@ -323,7 +355,7 @@ class AVX2_MOE_BASE {
     // Activation: SiLU(gate) * up — AVX2 version (8 elements at a time)
     apply_activation(activated_expert, nth, qlen);
     if (gate_up_only) {
-      copy_gate_up_intermediate(output);
+      copy_gate_up_intermediate(output, full_intermediate_size);
       return;
     }
 
@@ -351,12 +383,12 @@ class AVX2_MOE_BASE {
     // Weighted sum of expert outputs — AVX2 version (16 BF16 = 2x8 FP32 at a time)
     pool->do_work_stealing_job(
         qlen, nullptr,
-        [this, output, k, expert_ids, weights](int i) {
+        [this, output, k, expert_ids, weights, skip_mask](int i) {
           for (int e = 0; e < config_.hidden_size; e += 16) {
             __m256 x0 = _mm256_setzero_ps();
             __m256 x1 = _mm256_setzero_ps();
             for (int j = 0; j < k; j++) {
-              if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
+              if (skip_expert_(expert_ids[i * k + j], skip_mask)) continue;
               __m256 weight = _mm256_set1_ps(weights[i * k + j]);
               __m256 d0, d1;
               avx2::load_16xbf16_to_2x8xfp32(
@@ -374,14 +406,15 @@ class AVX2_MOE_BASE {
   }
 
   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output,
-                      bool gate_up_only = false) {
+                      bool gate_up_only = false, int full_intermediate_size = 0,
+                      const uint8_t* skip_mask = nullptr) {
     int qlen = 1;
     auto pool = config_.pool->get_subpool(tp_part_idx);
 
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < k; i++) {
-      if (config_.should_skip_expert(expert_ids[i])) continue;
+      if (skip_expert_(expert_ids[i], skip_mask)) continue;
       m_expert_id_map_[activated_expert] = expert_ids[i];
       m_local_pos_[0][i] = 0;
       m_local_num_[expert_ids[i]] = qlen;
@@ -463,7 +496,7 @@ class AVX2_MOE_BASE {
     // Activation
     apply_activation(activated_expert, nth, qlen);
     if (gate_up_only) {
-      copy_gate_up_intermediate(output);
+      copy_gate_up_intermediate(output, full_intermediate_size);
       return;
     }
 
@@ -493,7 +526,7 @@ class AVX2_MOE_BASE {
       __m256 x0 = _mm256_setzero_ps();
       __m256 x1 = _mm256_setzero_ps();
       for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[j])) continue;
+        if (skip_expert_(expert_ids[j], skip_mask)) continue;
         __m256 weight = _mm256_set1_ps(weights[j]);
         __m256 d0, d1;
         avx2::load_16xbf16_to_2x8xfp32(
@@ -641,25 +674,38 @@ class TP_MOE<AVX2_MOE_BASE<T, Derived>> : public TP_MOE_Common<AVX2_MOE_BASE<T, 
 
   void merge_results(int qlen, void* output) override { merge_results(qlen, output, false); }
 
+  // gate_up-only forward for HiLLM's shard tier. Gathers the routed tokens of the
+  // selected experts, computes the activation on the CPU, and writes the packed
+  // intermediate [total_tokens, intermediate_size] bf16 into `output`; the caller runs
+  // the down projection on the GPU.
+  //
+  // `skip_mask` (expert_num long, 1 = skip) selects the experts INSTEAD of the shared
+  // config.gpu_experts_mask, so this tier and the CPU tier (which owns that mask) can
+  // select disjoint experts in the same layer. nullptr -> the shared config mask.
+  //
+  // Supports tp_count>1: each TP part writes its column-slice of the intermediate into
+  // the full-width `output` at its column offset. The parts touch disjoint columns, so
+  // this fans out over NUMA with no merge step -- the down projection runs on the GPU
+  // over the reassembled full-width intermediate.
   void forward_gate_up(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-                       void* output) {
+                       void* output, const uint8_t* skip_mask) {
     if (this->weights_loaded == false) {
       throw std::runtime_error("Not Loaded");
     }
-    if (this->tp_count != 1) {
-      throw std::runtime_error("forward_gate_up requires threadpool_count==1 (single TP part)");
-    }
     KtComputeTimer _ct(this->last_compute_ns_);
     auto& tps = this->tps;
+    const int full_intermediate_size = this->config.intermediate_size;
     this->config.pool->dispense_backend()->do_numa_job(
-        [&tps, qlen, k, expert_ids, weights, input, output](int numa_id) {
-          tps[numa_id]->forward_gate_up(qlen, k, expert_ids, weights, input, output);
+        [&tps, qlen, k, expert_ids, weights, input, output, full_intermediate_size, skip_mask](int numa_id) {
+          tps[numa_id]->forward_gate_up(qlen, k, expert_ids, weights, input, output, full_intermediate_size,
+                                        skip_mask);
         });
   }
 
   void forward_gate_up_binding(int qlen, int k, intptr_t expert_ids, intptr_t weights, intptr_t input,
-                               intptr_t output) {
-    forward_gate_up(qlen, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output);
+                               intptr_t output, intptr_t skip_mask) {
+    forward_gate_up(qlen, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output,
+                    (const uint8_t*)skip_mask);
   }
 };
 
