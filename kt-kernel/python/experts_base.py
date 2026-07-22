@@ -555,6 +555,80 @@ class BaseMoEWrapper(_MoEBase, ABC):
             )
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
+    def submit_gate_up_and_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        cuda_stream,
+        forward_mask,
+        gate_up_mask,
+        gate_up_output: torch.Tensor,
+        staged=None,
+    ):
+        """Submit the shard gate_up task AND the CPU forward task in ONE cudaLaunchHostFunc.
+
+        Equivalent to submit_gate_up(mask=gate_up_mask, output=gate_up_output) FOLLOWED BY
+        submit_forward(mask=forward_mask): gate_up enters the FIFO first, forward second, so a
+        later sync_with_cuda_stream(allow_n_pending=1) still drains gate_up and leaves forward
+        pending -- identical semantics. The only difference is ONE host-node GPU<->CPU round-trip
+        instead of two (see CPUInfer.submit_pair_with_cuda_stream). A caller that always issues both
+        (HiLLM's shard + CPU tiers) halves this dispatch's host-node cost, which under CUDA graph
+        capture is a per-replay saving.
+
+        Deferred experts are not supported here (they would need a third task); the caller must use
+        the two separate submits when max_deferred_experts_per_token > 0.
+        """
+        if staged is None:
+            staged = self.stage_inputs(hidden_states, topk_ids, topk_weights)
+        (
+            input_tensor_cpu,
+            immediate_experts_ids_cpu,
+            _deferred_experts_ids_cpu,
+            weights_cpu,
+            output_cpu,
+            bsz_tensor_cpu,
+            current_slot,
+            deferred_ids,
+        ) = staged
+        if deferred_ids is not None:
+            raise RuntimeError(
+                "submit_gate_up_and_forward does not support deferred experts; use submit_gate_up "
+                "+ submit_forward when max_deferred_experts_per_token > 0."
+            )
+
+        # gate_up task (shard tier) -- byte-identical to submit_gate_up.
+        ids = immediate_experts_ids_cpu[current_slot]
+        gate_up_task = self.moe.gate_up_task(
+            ids.size(0),
+            ids.size(-1),
+            ids.data_ptr(),
+            weights_cpu[current_slot].data_ptr(),
+            input_tensor_cpu[current_slot].data_ptr(),
+            gate_up_output.data_ptr(),
+            gate_up_mask.data_ptr(),
+        )
+
+        # forward task (CPU tier) -- byte-identical to submit_forward's immediate path.
+        incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        args = (
+            bsz_tensor_cpu[current_slot].data_ptr(),
+            immediate_experts_ids_cpu[current_slot].size(-1),
+            immediate_experts_ids_cpu[current_slot].data_ptr(),
+            weights_cpu[current_slot].data_ptr(),
+            input_tensor_cpu[current_slot].data_ptr(),
+            output_cpu[current_slot].data_ptr(),
+            incremental,
+        )
+        if forward_mask is not None:
+            forward_task = self.moe.forward_task(*args, forward_mask.data_ptr())
+        else:
+            forward_task = self.moe.forward_task(*args)
+
+        # ONE host node: gate_up first (FIFO), then forward.
+        self.cpu_infer.submit_pair_with_cuda_stream(cuda_stream, gate_up_task, forward_task)
+        BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+
     def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
         """
         Synchronize and retrieve forward inference results.

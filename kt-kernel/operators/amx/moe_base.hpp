@@ -697,6 +697,16 @@ class AMX_MOE_BASE {
       activated_expert++;
     }
 
+    // An empty gate_up (no experts routed to the shard tier this step -- the common case, since
+    // HiLLM submits gate_up UNCONDITIONALLY every decode step for capturability) has nothing to
+    // compute. Return BEFORE the do_work_stealing_job fan-outs below so it never pays the AMX
+    // threadpool barrier (~tens of us): the caller reads only the rows the schedule produced (zero
+    // here), so the untouched intermediate is never read. ONLY for gate_up_only -- the full forward
+    // must still run its scatter to write the [S, H] of zeros an all-skip cpu_mask expects.
+    if (gate_up_only && activated_expert == 0) {
+      return;
+    }
+
     size_t offset = 0;
     for (int i = 0; i < activated_expert; i++) {
       auto expert_idx = m_expert_id_map_[i];

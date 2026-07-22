@@ -93,6 +93,38 @@ class CPUInfer {
     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)func, args);
 #endif
   }
+
+  // Submit TWO tasks in ONE cudaLaunchHostFunc. A caller that always issues a pair (HiLLM's shard
+  // gate_up + CPU forward) then pays ONE GPU->CPU->GPU host-node round-trip instead of two. The
+  // callback runs f1 then f2 in order, so the tasks enter the FIFO queue in exactly the order two
+  // back-to-back submit_with_cuda_stream calls would -- identical semantics (e.g. a later
+  // sync_with_cuda_stream(allow_n_pending=1) still drains f1 and leaves f2), only cheaper. Each
+  // args[0] is patched to `this` at submit time, as submit_with_cuda_stream does. PairArgs is
+  // leaked like SyncArgs: under CUDA graph capture the callback re-runs every replay with the same
+  // args pointer, so it must NOT be freed in the callback.
+  struct PairArgs {
+    void (*f1)(void*);
+    void* a1;
+    void (*f2)(void*);
+    void* a2;
+  };
+  static void submit_pair_(void* pair_args) {
+    PairArgs* pa = (PairArgs*)pair_args;
+    pa->f1(pa->a1);
+    pa->f2(pa->a2);
+  }
+  void submit_pair_with_cuda_stream(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params1,
+                                    std::pair<intptr_t, intptr_t> params2) {
+#if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || \
+    defined(KTRANSFORMERS_USE_MACA)
+    void* a1 = (void*)params1.second;
+    void* a2 = (void*)params2.second;
+    *((CPUInfer**)a1) = this;
+    *((CPUInfer**)a2) = this;
+    PairArgs* pa = new PairArgs{(void (*)(void*))params1.first, a1, (void (*)(void*))params2.first, a2};
+    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&submit_pair_, (void*)pa);
+#endif
+  }
 #endif
 
   struct SyncArgs {

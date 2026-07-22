@@ -421,6 +421,13 @@ class AVX2_MOE_BASE {
       activated_expert++;
     }
 
+    // Empty gate_up (no shard experts routed) -> nothing to compute; return before the
+    // do_work_stealing_job fan-outs so it never pays the threadpool barrier. Only for gate_up_only:
+    // the full forward must still scatter its [S, H] zeros. See the AMX moe_base.hpp twin.
+    if (gate_up_only && activated_expert == 0) {
+      return;
+    }
+
     size_t offset = 0;
     for (int i = 0; i < activated_expert; i++) {
       auto expert_idx = m_expert_id_map_[i];
