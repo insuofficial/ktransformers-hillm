@@ -29,6 +29,7 @@
 #endif
 
 #include "./vendors/vendor.h"
+#include "kt_log.h"
 #include "llama.cpp/ggml-impl.h"
 #include "task_queue.h"
 #include "worker_pool.h"
@@ -36,7 +37,7 @@
 class CPUInfer {
  public:
   CPUInfer(int thread_num) {
-    printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+    KT_LOG_INFO("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(thread_num);
     task_queue_ = new TaskQueue();
     for (int i = 0; i < (1 << 16); ++i) {
@@ -44,7 +45,7 @@ class CPUInfer {
     }
   }
   CPUInfer(int thread_num, int numa_id) {
-    printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+    KT_LOG_INFO("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(thread_num, numa_id);
     task_queue_ = new TaskQueue();
     for (int i = 0; i < (1 << 16); ++i) {
@@ -53,7 +54,7 @@ class CPUInfer {
   }
 
   CPUInfer(WorkerPoolConfig config) {
-    printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+    KT_LOG_INFO("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(config);
     task_queue_ = new TaskQueue();
     for (int i = 0; i < (1 << 16); ++i) {
@@ -62,7 +63,7 @@ class CPUInfer {
   }
 
   ~CPUInfer() {
-    printf("CPUInfer[0x%lx]: Goodbye\n", (intptr_t)this);
+    KT_LOG_INFO("CPUInfer[0x%lx]: Goodbye\n", (intptr_t)this);
     delete backend_;
     delete task_queue_;
   }
