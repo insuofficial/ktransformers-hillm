@@ -283,8 +283,8 @@ class AVXVNNI256_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVXVNNI256_RAW_INT4_M
     if (qc.zero_point) {
       throw std::runtime_error("AVX-VNNI-256 RAWINT4 only supports signed INT4 without zero point");
     }
-    printf("Created AVXVNNI256_RAW_INT4_MOE_TP %d at numa %d (group_size=%d)\n", tp_part_idx,
-           numa_node_of_cpu(sched_getcpu()), qc.group_size);
+    KT_LOG_INFO("Created AVXVNNI256_RAW_INT4_MOE_TP %d at numa %d (group_size=%d)\n", tp_part_idx,
+                numa_node_of_cpu(sched_getcpu()), qc.group_size);
   }
 
   ~AVXVNNI256_RAW_INT4_MOE_TP() = default;

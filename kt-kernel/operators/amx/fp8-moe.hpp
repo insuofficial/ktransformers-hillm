@@ -58,8 +58,8 @@ class AMX_FP8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP8_MOE_TP<T>> {
     // Backend reflects the compile-time GEMM path: AMX tiles when __AMXBF16__ etc. are
     // defined, otherwise the AVX512-BF16 fallback in amx_raw_kernels.hpp::float_mat_vec_kgroup.
     constexpr const char* backend = amx::AMX_AVAILABLE ? "AMX" : "AVX512-BF16";
-    printf("Created FP8_MOE_TP %d at numa %d (backend=%s)\n", tp_part_idx,
-           numa_node_of_cpu(sched_getcpu()), backend);
+    KT_LOG_INFO("Created FP8_MOE_TP %d at numa %d (backend=%s)\n", tp_part_idx,
+                numa_node_of_cpu(sched_getcpu()), backend);
   }
 
   ~AMX_FP8_MOE_TP() = default;

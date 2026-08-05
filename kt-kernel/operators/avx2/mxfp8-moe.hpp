@@ -331,9 +331,9 @@ class AVX2_MXFP8_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP8_MOE_TP<T>> {
         config_.intermediate_size % quant_config.group_size != 0) {
       throw std::runtime_error("AVX2 MXFP8 MoE: hidden_size and intermediate_size must be divisible by group_size");
     }
-    printf("Created AVX2_MXFP8_MOE_TP %d at numa %d (group_size=%d, swiglu_alpha=%.4f, swiglu_limit=%.4f)\n",
-           tp_part_idx, numa_node_of_cpu(sched_getcpu()),
-           quant_config.group_size, config_.swiglu_alpha, config_.swiglu_limit);
+    KT_LOG_INFO("Created AVX2_MXFP8_MOE_TP %d at numa %d (group_size=%d, swiglu_alpha=%.4f, swiglu_limit=%.4f)\n",
+                tp_part_idx, numa_node_of_cpu(sched_getcpu()),
+                quant_config.group_size, config_.swiglu_alpha, config_.swiglu_limit);
   }
 
   ~AVX2_MXFP8_MOE_TP() = default;

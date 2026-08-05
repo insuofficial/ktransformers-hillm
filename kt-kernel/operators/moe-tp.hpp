@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <type_traits>
 
+#include "../cpu_backend/kt_log.h"
 #include "../cpu_backend/shared_mem_buffer.h"
 #include "common.hpp"
 
@@ -54,8 +55,8 @@ class TP_MOE_Common : public MoE_Interface {
   int64_t last_compute_ns() const { return last_compute_ns_.load(std::memory_order_relaxed); }
   using input_t = typename T::input_t;
   TP_MOE_Common(const GeneralMOEConfig& config) : config(config) {
-    printf("TP MOE layer %d, pool: 0x%lx, expert num: %d, num_experts_per_tok: %d\n", config.layer_idx,
-           (intptr_t)config.pool, config.expert_num, config.num_experts_per_tok);
+    KT_LOG_INFO("TP MOE layer %d, pool: 0x%lx, expert num: %d, num_experts_per_tok: %d\n", config.layer_idx,
+                (intptr_t)config.pool, config.expert_num, config.num_experts_per_tok);
     if (config.pool == nullptr) {
       printf("TP MOE layer %d, no worker pool\n", config.layer_idx);
       throw std::runtime_error("no worker pool");

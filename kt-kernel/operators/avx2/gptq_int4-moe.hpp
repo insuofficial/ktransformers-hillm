@@ -227,8 +227,8 @@ class AVX2_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_GPTQ_INT4_MOE_TP<T>> 
     if (qc.group_size == 0) {
       throw std::runtime_error("GPTQ INT4 requires group_size > 0");
     }
-    printf("Created AVX2_GPTQ_INT4_MOE_TP %d at numa %d (group_size=%d)\n",
-           tp_part_idx, numa_node_of_cpu(sched_getcpu()), qc.group_size);
+    KT_LOG_INFO("Created AVX2_GPTQ_INT4_MOE_TP %d at numa %d (group_size=%d)\n",
+                tp_part_idx, numa_node_of_cpu(sched_getcpu()), qc.group_size);
   }
 
   ~AVX2_GPTQ_INT4_MOE_TP() = default;

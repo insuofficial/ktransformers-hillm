@@ -351,8 +351,8 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
   void derived_init() {
     if (config_.quant_config.group_size == 0 || config_.quant_config.zero_point)
       throw std::runtime_error("MXFP4 AVX2 MoE requires KGroup FP4 without zero point");
-    printf("Created AVX2_MXFP4_MOE_TP %d at numa %d (group_size=%d)\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()),
-           config_.quant_config.group_size);
+    KT_LOG_INFO("Created AVX2_MXFP4_MOE_TP %d at numa %d (group_size=%d)\n", tp_part_idx,
+                numa_node_of_cpu(sched_getcpu()), config_.quant_config.group_size);
   }
 
   size_t buffer_a_required_size_impl(size_t m, size_t k) const {

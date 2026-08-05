@@ -21,11 +21,12 @@
 #include <stdexcept>
 
 #include "hwloc.h"
+#include "kt_log.h"
 
 thread_local int WorkerPool::thread_local_id = -1;
 
 InNumaPool::InNumaPool(int max_thread_num) {
-  printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
+  KT_LOG_INFO("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
   total_worker_count = max_thread_num;
   set_restricted_worker_count(total_worker_count);
   thread_state_ = std::unique_ptr<ThreadState[]>(new ThreadState[max_thread_num]);
@@ -39,13 +40,13 @@ InNumaPool::InNumaPool(int max_thread_num) {
 }
 
 InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
-  printf("===========In NumaPool============\n");
+  KT_LOG_INFO("===========In NumaPool============\n");
   hwloc_topology_t topology;
   hwloc_obj_t numa_obj, core_obj;
   hwloc_bitmap_t cpuset;
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
-  printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
+  KT_LOG_INFO("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
   total_worker_count = max_thread_num;
   set_restricted_worker_count(total_worker_count);
   thread_state_ = std::unique_ptr<ThreadState[]>(new ThreadState[max_thread_num]);
@@ -412,11 +413,11 @@ void NumaJobDistributor::worker_thread(int numa_id) {
 }
 
 void WorkerPool::init(WorkerPoolConfig config) {
-  printf("WorkerPool[0x%lx] %d subpools, [numa:threads]", (intptr_t)this, config.subpool_count);
+  KT_LOG_INFO("WorkerPool[0x%lx] %d subpools, [numa:threads]", (intptr_t)this, config.subpool_count);
   for (int i = 0; i < config.subpool_count; i++) {
-    printf("[%d:%d] ", config.subpool_numa_map[i], config.subpool_thread_count[i]);
+    KT_LOG_INFO("[%d:%d] ", config.subpool_numa_map[i], config.subpool_thread_count[i]);
   }
-  printf("\n");
+  KT_LOG_INFO("\n");
 
   for (int i = 0; i < config.subpool_count; i++) {
     numa_worker_pools.push_back(nullptr);

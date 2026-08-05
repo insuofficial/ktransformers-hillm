@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "../../cpu_backend/kt_log.h"
 #include "../../cpu_backend/shared_mem_buffer.h"
 #include "../../cpu_backend/worker_pool.h"
 #include "../common.hpp"

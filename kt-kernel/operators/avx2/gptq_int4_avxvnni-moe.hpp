@@ -276,8 +276,8 @@ class AVXVNNI256_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVXVNNI256_GPTQ_INT4
     if (qc.group_size > avxvnni::MAX_SUPPORTED_GROUP_SIZE) {
       throw std::runtime_error("AVX-VNNI-256 GPTQ_INT4 requires group_size <= 256");
     }
-    printf("Created AVXVNNI256_GPTQ_INT4_MOE_TP %d at numa %d (group_size=%d)\n", tp_part_idx,
-           numa_node_of_cpu(sched_getcpu()), qc.group_size);
+    KT_LOG_INFO("Created AVXVNNI256_GPTQ_INT4_MOE_TP %d at numa %d (group_size=%d)\n", tp_part_idx,
+                numa_node_of_cpu(sched_getcpu()), qc.group_size);
   }
 
   ~AVXVNNI256_GPTQ_INT4_MOE_TP() = default;

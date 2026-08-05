@@ -31,6 +31,9 @@ Example usage:
 Environment Variables:
     KT_KERNEL_CPU_VARIANT: Override automatic detection ('amx', 'avx512', 'avx2')
     KT_KERNEL_DEBUG: Enable debug output ('1' to enable)
+    KT_KERNEL_VERBOSE: Print the C++ setup banners -- worker-pool topology and the per-layer
+        MoE construction lines -- that are silenced by default ('1' to enable). Implied by
+        KT_KERNEL_DEBUG=1. See cpu_backend/kt_log.h.
 """
 
 from __future__ import annotations
