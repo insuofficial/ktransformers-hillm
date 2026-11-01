@@ -16,6 +16,30 @@
 #include <iostream>
 #include <thread>
 
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+namespace {
+// Spin this long before sleeping on the condition variable: a condvar wake costs 7-14 us (more under
+// load), while decode waits ~0.15-0.26 ms for a task and submits one every ~0.8 ms (~3 ms across steps).
+constexpr auto kSyncSpin = std::chrono::milliseconds(1);
+constexpr auto kDispatchSpin = std::chrono::milliseconds(10);
+
+// Spin until pred() or the window ends; true if pred() held.
+template <class Pred>
+bool spin_until(Pred pred, std::chrono::steady_clock::duration window) {
+  const auto t0 = std::chrono::steady_clock::now();
+  while (!pred()) {
+    if (std::chrono::steady_clock::now() - t0 > window) return false;
+#if defined(__x86_64__)
+    _mm_pause();
+#endif
+  }
+  return true;
+}
+}  // namespace
+
 TaskQueue::TaskQueue() : done(false), pending(0) {
   Node* dummy = new Node();
   head.store(dummy, std::memory_order_relaxed);
@@ -51,13 +75,17 @@ void TaskQueue::enqueue(std::function<void()> task) {
 }
 
 void TaskQueue::sync(size_t allow_n_pending) {
+  auto ready = [&] {
+    return pending.load(std::memory_order_acquire) <= allow_n_pending
+        || done.load(std::memory_order_acquire);
+  };
+  // After a successful spin the wait below returns at once; the lock is still needed to read
+  // the task exception.
+  spin_until(ready, kSyncSpin);
   std::exception_ptr task_exception;
   {
     std::unique_lock<std::mutex> lock(mtx);
-    cv.wait(lock, [&] {
-      return pending.load(std::memory_order_acquire) <= allow_n_pending
-          || done.load(std::memory_order_acquire);
-    });
+    cv.wait(lock, ready);
     task_exception = first_exception;
     first_exception = nullptr;
   }
@@ -89,11 +117,13 @@ void TaskQueue::worker() {
       }
       cv.notify_all();
     } else {
-      std::unique_lock<std::mutex> lock(mtx);
-      cv.wait(lock, [&] {
+      auto has_work = [&] {
         return curr->next.load(std::memory_order_acquire) != nullptr
             || done.load(std::memory_order_acquire);
-      });
+      };
+      if (spin_until(has_work, kDispatchSpin)) continue;
+      std::unique_lock<std::mutex> lock(mtx);
+      cv.wait(lock, has_work);
     }
   }
 }
