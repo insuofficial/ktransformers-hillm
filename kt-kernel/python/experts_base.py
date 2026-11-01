@@ -1121,7 +1121,18 @@ class BaseMoEWrapper(_MoEBase, ABC):
         Example:
             >>> BaseMoEWrapper.set_capture_batch_sizes([1, 2, 4, 8, 16])
         """
-        KExpertsCPUBuffer.capture_bs = capture_bs
+        KExpertsCPUBuffer.capture_bs = list(dict.fromkeys(int(bs) for bs in capture_bs))
+        # Graph mode can be enabled after an eager call already created the requested
+        # decode bundle as ``temp_buffer``. Promote that exact bundle immediately;
+        # otherwise get_buffer() takes its temp-key early return and never inserts it
+        # into capture_buffers, leaving output_gpu unanchored.
+        if (
+            KExpertsCPUBuffer.temp_buffer
+            and KExpertsCPUBuffer.temp_bs in KExpertsCPUBuffer.capture_bs
+        ):
+            KExpertsCPUBuffer.capture_buffers[
+                KExpertsCPUBuffer.temp_key
+            ] = KExpertsCPUBuffer.temp_buffer
 
     @staticmethod
     def get_capture_batch_sizes() -> List[int]:
