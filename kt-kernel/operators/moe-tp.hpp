@@ -5,7 +5,13 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
+#include <vector>
 
 #include "../cpu_backend/kt_log.h"
 #include "../cpu_backend/shared_mem_buffer.h"
@@ -23,8 +29,11 @@ concept MOE_TP_PART = requires(T t, int qlen, int k, const int64_t* expert_ids, 
   // { t.load_weights() } -> std::same_as<void>;
 };
 
-template <MOE_TP_PART T>
+template <MOE_TP_PART T, typename Concrete = T>
 class TP_MOE_Common : public MoE_Interface {
+  static_assert(std::is_base_of_v<T, Concrete>);
+  static_assert(std::is_constructible_v<Concrete, GeneralMOEConfig, int>);
+
  protected:
   std::vector<GeneralMOEConfig> tp_configs;
   int tp_count;
@@ -54,7 +63,11 @@ class TP_MOE_Common : public MoE_Interface {
   // Worker-thread compute time (ns) of the most recent forward task (see above).
   int64_t last_compute_ns() const { return last_compute_ns_.load(std::memory_order_relaxed); }
   using input_t = typename T::input_t;
-  TP_MOE_Common(const GeneralMOEConfig& config) : config(config) {
+  using PartFactory = std::function<std::unique_ptr<T>(const GeneralMOEConfig&, int)>;
+
+  TP_MOE_Common(const GeneralMOEConfig& config) : TP_MOE_Common(config, PartFactory{}) {}
+
+  TP_MOE_Common(const GeneralMOEConfig& config, PartFactory part_factory) : config(config) {
     KT_LOG_INFO("TP MOE layer %d, pool: 0x%lx, expert num: %d, num_experts_per_tok: %d\n", config.layer_idx,
                 (intptr_t)config.pool, config.expert_num, config.num_experts_per_tok);
     if (config.pool == nullptr) {
@@ -131,8 +144,26 @@ class TP_MOE_Common : public MoE_Interface {
       }
     }
 
-    config.pool->dispense_backend()->do_numa_job(
-        [this, config](int i) { tps[i] = std::move(std::unique_ptr<T>(new T(tp_configs[i], i))); });
+    std::vector<std::exception_ptr> construction_errors(tp_count);
+    config.pool->dispense_backend()->do_numa_job([this, &construction_errors, &part_factory](int i) {
+      try {
+        tps[i] = part_factory ? part_factory(tp_configs[i], i) : std::unique_ptr<T>(new Concrete(tp_configs[i], i));
+      } catch (...) {
+        construction_errors[i] = std::current_exception();
+      }
+    });
+    for (int i = 0; i < tp_count; ++i) {
+      if (!construction_errors[i]) continue;
+      try {
+        std::rethrow_exception(construction_errors[i]);
+      } catch (const std::exception& error) {
+        throw std::runtime_error("TP/NUMA " + std::to_string(i) +
+                                 " construction failed: " + error.what());
+      } catch (...) {
+        throw std::runtime_error("TP/NUMA " + std::to_string(i) +
+                                 " construction failed with an unknown error");
+      }
+    }
 
     local_output_numa.resize(tp_count, nullptr);
     MemoryRequest mem_requests;
@@ -147,6 +178,8 @@ class TP_MOE_Common : public MoE_Interface {
     // printf("local output tp, %d,\n", tp_configs[0].max_possible_qlen());
     shared_mem_buffer.alloc(this, mem_requests);
   }
+
+  ~TP_MOE_Common() { shared_mem_buffer.dealloc(this); }
 
   void warm_up() {
     int qlen = config.max_possible_qlen();

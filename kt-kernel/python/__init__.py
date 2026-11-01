@@ -34,6 +34,7 @@ Environment Variables:
     KT_KERNEL_VERBOSE: Print the C++ setup banners -- worker-pool topology and the per-layer
         MoE construction lines -- that are silenced by default ('1' to enable). Implied by
         KT_KERNEL_DEBUG=1. See cpu_backend/kt_log.h.
+    KT_INT8_VNNI_BACKEND: Select the AVX512 INT8 backend ('auto', 'onednn', or 'native')
 """
 
 from __future__ import annotations
@@ -42,6 +43,13 @@ from __future__ import annotations
 from ._cpu_detect import initialize as _initialize_cpu
 
 _kt_kernel_ext, __cpu_variant__ = _initialize_cpu()
+__cpu_variant__ = getattr(_kt_kernel_ext, "__cpu_variant__", __cpu_variant__)
+__int8_kernel__ = getattr(_kt_kernel_ext, "__int8_kernel__", "unknown")
+__int8_weight_layout__ = getattr(
+    _kt_kernel_ext,
+    "__int8_weight_layout__",
+    "kt-int8-n32-k64-vnni-v1",
+)
 
 # Make the extension module available to other modules in this package
 import sys
@@ -96,4 +104,13 @@ except ImportError:
     except ImportError:
         __version__ = "0.6.1"
 
-__all__ = ["KTMoEWrapper", "AMXSFTMoEWrapper", "generate_gpu_experts_masks", "kt_kernel_ext", "__cpu_variant__", "__version__"]
+__all__ = [
+    "KTMoEWrapper",
+    "AMXSFTMoEWrapper",
+    "generate_gpu_experts_masks",
+    "kt_kernel_ext",
+    "__cpu_variant__",
+    "__int8_kernel__",
+    "__int8_weight_layout__",
+    "__version__",
+]

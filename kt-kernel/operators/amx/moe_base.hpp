@@ -86,6 +86,20 @@ class AMX_MOE_BASE {
     derived()->derived_init();
   }
 
+  void set_staged_weight_pointers(void* gate, void* up, void* down, void* gate_scale, void* up_scale,
+                                  void* down_scale) {
+    config_.gate_proj = gate;
+    config_.up_proj = up;
+    config_.down_proj = down;
+    config_.gate_scale = gate_scale;
+    config_.up_scale = up_scale;
+    config_.down_scale = down_scale;
+  }
+
+  void clear_staged_weight_pointers() {
+    set_staged_weight_pointers(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  }
+
   void init() {
     if (config_.load && config_.path == "") {
       config_.load = false;
@@ -151,6 +165,8 @@ class AMX_MOE_BASE {
 
     shared_mem_buffer_numa.alloc(tp_part_idx, this, mem_requests);
   }
+
+  ~AMX_MOE_BASE() { shared_mem_buffer_numa.dealloc(tp_part_idx, this); }
 
   void warm_up() {
     int qlen = config_.max_len;
@@ -770,7 +786,7 @@ class AMX_MOE_BASE {
       gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
       size_t ba_size = align64(buffer_a_required_size(max_m, config_.hidden_size));
       gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
-      gate_up_ba_[expert_idx]->from_mat(qlen, (ggml_bf16_t*)input, 0, 1);
+      derived()->prepare_decode_gate_input(expert_idx, qlen, input);
     }
 
 #ifdef FORWARD_TIME_PROFILE
@@ -807,7 +823,7 @@ class AMX_MOE_BASE {
     }
 #endif
 
-    apply_activation(activated_expert, nth, qlen);
+    derived()->apply_decode_activation(activated_expert, nth, qlen);
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -827,7 +843,7 @@ class AMX_MOE_BASE {
         activated_expert, nullptr,
         [this, qlen](int task_id) {
           int expert_idx = m_expert_id_map_[task_id];
-          down_ba_[expert_idx]->from_mat(qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
+          derived()->prepare_decode_down_input(expert_idx, qlen);
         },
         nullptr);
 
@@ -900,6 +916,18 @@ class AMX_MOE_BASE {
   Derived* derived() { return static_cast<Derived*>(this); }
   const Derived* derived_const() const { return static_cast<const Derived*>(this); }
 
+  void prepare_decode_gate_input(int expert_idx, int qlen, const void* input) {
+    gate_up_ba_[expert_idx]->from_mat(qlen, (ggml_bf16_t*)input, 0, 1);
+  }
+
+  void prepare_decode_down_input(int expert_idx, int qlen) {
+    down_ba_[expert_idx]->from_mat(qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
+  }
+
+  void apply_decode_activation(int activated_expert, int nth, int qlen) {
+    apply_activation(activated_expert, nth, qlen);
+  }
+
   // ============================================================================
   // Derived class initialization hook
   // Called after base class init() completes, allows derived classes to perform
@@ -964,8 +992,12 @@ class AMX_MOE_BASE {
   }
 
   void apply_activation(int activated_expert, int nth, int qlen) {
+    apply_activation_to(activated_expert, nth, qlen, m_local_gate_output_ptr_);
+  }
+
+  void apply_activation_to(int activated_expert, int nth, int qlen, const std::vector<ggml_bf16_t*>& destination_ptrs) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
-    auto fn = [this, nth](int task_id) {
+    auto fn = [this, nth, &destination_ptrs](int task_id) {
       int expert_idx = m_expert_id_map_[task_id / nth];
       int ith = task_id % nth;
       auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
@@ -974,6 +1006,7 @@ class AMX_MOE_BASE {
       for (int i = 0; i < m_local_num_[expert_idx]; i++) {
         ggml_bf16_t* gate_output_ptr = &m_local_gate_output_ptr_[expert_idx][i * config_.intermediate_size];
         ggml_bf16_t* up_output_ptr = &m_local_up_output_ptr_[expert_idx][i * config_.intermediate_size];
+        ggml_bf16_t* destination_ptr = &destination_ptrs[expert_idx][i * config_.intermediate_size];
         for (int j = n_start; j < n_end; j += 32) {
           __m512 gate_val0, gate_val1, up_val0, up_val1;
           avx512_32xbf16_to_32xfp32((__m512i*)(gate_output_ptr + j), &gate_val0, &gate_val1);
@@ -986,7 +1019,7 @@ class AMX_MOE_BASE {
           __m512 result1 = config_.activation_type == 1
                                ? amx::gpt_oss_act_fn(gate_val1, up_val1)
                                : amx::act_fn(gate_val1, up_val1, config_.swiglu_limit, config_.swiglu_alpha);
-          avx512_32xfp32_to_32xbf16(&result0, &result1, (__m512i*)(gate_output_ptr + j));
+          avx512_32xfp32_to_32xbf16(&result0, &result1, (__m512i*)(destination_ptr + j));
         }
       }
     };

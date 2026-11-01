@@ -12,16 +12,29 @@ small MLPs on GPU), shared experts, and multi-GPU rank-0-only execution.
 from __future__ import annotations
 
 import logging
+import math
 import os
-from typing import Any
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+if TYPE_CHECKING:
+    from .lora import LoRAExperts
+
 from .arch import MOEArchConfig
-from .autograd import KTMoEFunction
+from .autograd import (
+    KTMoEFunction,
+    _poison_checkpoint_cache,
+    _sync_any_rank_exception,
+    _sync_rank0_exception,
+)
+from .config import KTActivationPolicy
 from .dist_utils import (
+    _all_gather_checkpoint_state,
     _all_gather_qlens,
     _checkpoint_hook_mode,
     _dist_gather_varlen_to_rank0,
@@ -31,6 +44,189 @@ from .dist_utils import (
 
 logger = logging.getLogger(__name__)
 _KT_SFT_DEBUG = os.environ.get("KT_SFT_DEBUG", "0") == "1"
+
+
+class _DeepseekRouterLinear(nn.Linear):
+    """PEFT-compatible proxy preserving DeepSeek's FP32 gate projection."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        weight = self.weight.float()
+        bias = self.bias.float() if self.bias is not None else None
+        return F.linear(input.float(), weight, bias)
+
+
+@dataclass(frozen=True)
+class DeepSeekRoutingSpec:
+    """Validated routing semantics shared by remote and native DeepSeek MoE."""
+
+    expert_num: int
+    n_group: int
+    topk_group: int
+    top_k: int
+    norm_topk_prob: bool
+    routed_scaling_factor: float
+
+    @classmethod
+    def from_modules(
+        cls,
+        *,
+        moe: nn.Module,
+        router: nn.Module,
+        expert_num: int,
+    ) -> "DeepSeekRoutingSpec":
+        sources = [
+            ("moe", moe),
+            ("router", router),
+            ("moe.config", getattr(moe, "config", None)),
+            ("router.config", getattr(router, "config", None)),
+        ]
+
+        def resolve(name: str, aliases: tuple[str, ...]) -> Any:
+            observed: list[tuple[str, Any]] = []
+            for source_name, source in sources:
+                if source is None:
+                    continue
+                for alias in aliases:
+                    if hasattr(source, alias):
+                        value = getattr(source, alias)
+                        if value is not None:
+                            observed.append((f"{source_name}.{alias}", value))
+                            break
+            if not observed:
+                raise ValueError(
+                    f"DeepSeek routing metadata {name!r} is missing; checked "
+                    + ", ".join(source_name for source_name, _ in sources)
+                )
+            first_source, first_value = observed[0]
+            for source_name, value in observed[1:]:
+                if value != first_value:
+                    raise ValueError(
+                        f"Conflicting DeepSeek routing metadata for {name}: "
+                        f"{first_source}={first_value!r}, {source_name}={value!r}"
+                    )
+            return first_value
+
+        def positive_int(name: str, aliases: tuple[str, ...]) -> int:
+            value = resolve(name, aliases)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"DeepSeek routing metadata {name} must be a positive integer, "
+                    f"got {value!r}"
+                )
+            return int(value)
+
+        n_group = positive_int("n_group", ("n_group",))
+        topk_group = positive_int("topk_group", ("topk_group",))
+        routed_expert_num = positive_int(
+            "n_routed_experts",
+            ("n_routed_experts", "num_local_experts"),
+        )
+        top_k = positive_int(
+            "top_k",
+            ("top_k", "num_experts_per_tok"),
+        )
+        norm_topk_prob = resolve("norm_topk_prob", ("norm_topk_prob",))
+        if not isinstance(norm_topk_prob, bool):
+            raise ValueError(
+                "DeepSeek routing metadata norm_topk_prob must be bool, "
+                f"got {norm_topk_prob!r}"
+            )
+        routed_scaling_factor = float(
+            resolve("routed_scaling_factor", ("routed_scaling_factor",))
+        )
+        if not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0:
+            raise ValueError(
+                "DeepSeek routed_scaling_factor must be finite and positive, "
+                f"got {routed_scaling_factor!r}"
+            )
+
+        expert_num = int(expert_num)
+        if routed_expert_num != expert_num:
+            raise ValueError(
+                "DeepSeek routed expert count does not match the KT architecture: "
+                f"routing={routed_expert_num}, kt={expert_num}"
+            )
+        if expert_num <= 0 or expert_num % n_group:
+            raise ValueError(
+                "DeepSeek expert_num must be positive and divisible by n_group, "
+                f"got expert_num={expert_num}, n_group={n_group}"
+            )
+        experts_per_group = expert_num // n_group
+        if experts_per_group < 2:
+            raise ValueError(
+                "DeepSeek group-top2 routing requires at least two experts per group"
+            )
+        if topk_group > n_group:
+            raise ValueError(
+                f"DeepSeek topk_group={topk_group} exceeds n_group={n_group}"
+            )
+        if top_k > topk_group * experts_per_group:
+            raise ValueError(
+                f"DeepSeek top_k={top_k} exceeds the {topk_group * experts_per_group} "
+                "experts available in selected groups"
+            )
+        return cls(
+            expert_num=expert_num,
+            n_group=n_group,
+            topk_group=topk_group,
+            top_k=top_k,
+            norm_topk_prob=norm_topk_prob,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+
+def _activation_checkpoint_action(policy: KTActivationPolicy, phase: str) -> str:
+    """Map public activation policy and checkpoint phase to collective control."""
+    if policy.gpu == "recompute" and policy.cpu == "retain":
+        if phase == "first_forward":
+            return "cache_first_forward"
+        if phase == "recompute":
+            return "reuse_recompute"
+    return "normal"
+
+
+def _validate_activation_checkpoint_phase(
+    policy: KTActivationPolicy,
+    phase: str,
+    *,
+    requires_backward: bool = False,
+) -> None:
+    if phase not in ("none", "first_forward", "recompute"):
+        raise RuntimeError(f"Cannot determine activation checkpoint phase: {phase}")
+    if policy.gpu == "retain" and phase in ("first_forward", "recompute"):
+        raise RuntimeError(
+            "activation_policy.gpu=retain conflicts with active gradient checkpointing"
+        )
+    if requires_backward and policy.gpu == "recompute" and phase == "none":
+        raise RuntimeError(
+            "activation_policy.gpu=recompute requires non-reentrant gradient "
+            "checkpointing with the KT context_fn"
+        )
+
+
+def _strip_kt_zero_storage_from_state_dict(module, state_dict, prefix, local_metadata) -> None:
+    """Never serialize expert placeholders that do not contain real weights."""
+    del local_metadata
+    for name, param in module.named_parameters():
+        if getattr(param, "_kt_zero_storage", False):
+            state_dict.pop(f"{prefix}{name}", None)
+
+
+def _supply_kt_zero_storage_for_state_dict_load(
+    module,
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
+) -> None:
+    """Keep placeholder keys out of checkpoints without reporting them missing."""
+    del local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    for name, param in module.named_parameters():
+        if getattr(param, "_kt_zero_storage", False):
+            state_dict[f"{prefix}{name}"] = param
 
 
 class KTMoELayerWrapper(nn.Module):
@@ -45,6 +241,9 @@ class KTMoELayerWrapper(nn.Module):
         hidden_size: int,
         layer_idx: int,
         lora_experts: "LoRAExperts | None" = None,
+        full_weight_grad: bool | None = None,
+        uses_authoritative_optimizer_grads: bool | None = None,
+        activation_policy: KTActivationPolicy | None = None,
     ):
         super().__init__()
         self._is_kt_moe_wrapper = True
@@ -62,19 +261,93 @@ class KTMoELayerWrapper(nn.Module):
 
         # 1. gate/router FIRST - keep original attribute name for PEFT compatibility
         router_attr = moe_config.router_attr  # "gate" for Qwen3/DeepSeek
-        setattr(self, router_attr, getattr(original_moe, router_attr, None))
+        original_router = getattr(original_moe, router_attr, None)
+        self._original_router = None  # Set when router is not nn.Linear (e.g. TopKRouter)
+
+        if original_router is not None and isinstance(original_router, nn.Linear):
+            # transformers <=4.x / some models: gate is nn.Linear - register directly.
+            setattr(self, router_attr, original_router)
+        elif original_router is not None and hasattr(original_router, "weight") and isinstance(
+            getattr(original_router, "weight"), nn.Parameter
+        ):
+            # transformers v5+: gate is a TopKRouter with nn.Parameter weight.
+            # Wrap it in nn.Linear so PEFT can discover and inject LoRA.
+            # The nn.Linear shares the same weight tensor - LoRA applied to it
+            # is equivalent to LoRA on the original gate.
+            router_weight = original_router.weight
+            router_linear_cls = _DeepseekRouterLinear if self.router_type == "deepseek_gate" else nn.Linear
+            router_linear = router_linear_cls(
+                router_weight.shape[1], router_weight.shape[0], bias=False,
+            )
+            router_linear.weight = router_weight  # share the same parameter
+            setattr(self, router_attr, router_linear)
+            # Keep the original router for forward (top-k selection logic)
+            self._original_router = original_router
+        else:
+            setattr(self, router_attr, original_router)
         self._router_attr = router_attr
+        self._deepseek_routing_spec: DeepSeekRoutingSpec | None = None
+        if self.router_type == "deepseek_gate" and self._original_router is not None:
+            self._deepseek_routing_spec = DeepSeekRoutingSpec.from_modules(
+                moe=original_moe,
+                router=self._original_router,
+                expert_num=moe_config.expert_num,
+            )
+            correction_bias = getattr(
+                self._original_router,
+                "e_score_correction_bias",
+                None,
+            )
+            if not isinstance(correction_bias, torch.Tensor) or tuple(
+                correction_bias.shape
+            ) != (int(moe_config.expert_num),):
+                raise ValueError(
+                    f"Layer {layer_idx}: DeepSeek correction bias must have shape "
+                    f"({moe_config.expert_num},), got "
+                    f"{getattr(correction_bias, 'shape', None)}"
+                )
 
         # 2. experts SECOND (this is what PEFT targets for LoRA)
         experts_attr = moe_config.experts_attr  # typically "experts"
         setattr(self, experts_attr, getattr(original_moe, experts_attr, None))
         self._experts_attr = experts_attr
 
-        # 3. shared_experts (if any)
-        if moe_config.has_shared_experts and hasattr(original_moe, "shared_experts"):
-            self.shared_experts = original_moe.shared_experts
-        else:
-            self.shared_experts = None
+        # 3. Shared expert (if any). DeepSeek/GLM use ``shared_experts`` while
+        # Qwen2-MoE/Qwen3.5 use ``shared_expert`` plus a sigmoid gate. Preserve
+        # the original attribute names so state_dict/checkpoint keys stay
+        # compatible with the Hugging Face model.
+        self._shared_expert_attr: str | None = None
+        self._shared_expert_gate_attr: str | None = None
+        if moe_config.has_shared_experts:
+            for shared_expert_attr in ("shared_experts", "shared_expert"):
+                shared_expert = getattr(original_moe, shared_expert_attr, None)
+                if shared_expert is not None:
+                    setattr(self, shared_expert_attr, shared_expert)
+                    self._shared_expert_attr = shared_expert_attr
+                    break
+
+            if self._shared_expert_attr is None:
+                raise ValueError(
+                    f"Layer {layer_idx}: architecture declares shared experts, "
+                    "but the MoE module has neither 'shared_experts' nor 'shared_expert'"
+                )
+
+            gate_candidates = (
+                ("shared_expert_gate", "shared_experts_gate")
+                if self._shared_expert_attr == "shared_expert"
+                else ("shared_experts_gate", "shared_expert_gate")
+            )
+            for shared_expert_gate_attr in gate_candidates:
+                shared_expert_gate = getattr(original_moe, shared_expert_gate_attr, None)
+                if shared_expert_gate is not None:
+                    setattr(self, shared_expert_gate_attr, shared_expert_gate)
+                    self._shared_expert_gate_attr = shared_expert_gate_attr
+                    break
+            if self._shared_expert_attr == "shared_expert" and self._shared_expert_gate_attr is None:
+                raise ValueError(
+                    f"Layer {layer_idx}: singular 'shared_expert' requires "
+                    "'shared_expert_gate' for Qwen-style gated output"
+                )
 
         # 4. lora_experts (separate LoRA expert MLPs, different from PEFT LoRA on experts)
         self.lora_experts = lora_experts
@@ -83,11 +356,60 @@ class KTMoELayerWrapper(nn.Module):
         # _peft_lora_modules: {expert_idx: {proj_name: (lora_A, lora_B)}}
         self._peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]] | None = None
         self._lora_pointers_dirty = False
+        self._kt_managed_lora_enabled = False
+
+        # Training-mode flags must be identical on every distributed rank even
+        # though only rank 0 owns the backend object.
+        if full_weight_grad is None:
+            full_weight_grad = getattr(wrapper, "_full_weight_grad", False) if wrapper is not None else False
+        if uses_authoritative_optimizer_grads is None:
+            uses_authoritative_optimizer_grads = bool(
+                wrapper is not None and getattr(wrapper, "_uses_authoritative_optimizer_grads", False)
+            )
+        self._full_weight_grad = bool(full_weight_grad)
+        self._uses_authoritative_optimizer_grads = bool(uses_authoritative_optimizer_grads)
+        if activation_policy is None:
+            # Direct callers without the new policy retain the old behavior:
+            # normal training keeps both activation tiers, while the legacy
+            # reuse flag keeps CPU activations across GPU recomputation.
+            if wrapper is not None and getattr(wrapper, "reuse_checkpoint_forward", False):
+                activation_policy = KTActivationPolicy(cpu="retain", gpu="recompute")
+            else:
+                activation_policy = KTActivationPolicy(cpu="retain", gpu="retain")
+        self._kt_activation_policy = activation_policy
+        self.register_state_dict_post_hook(_strip_kt_zero_storage_from_state_dict)
+        self.register_load_state_dict_pre_hook(_supply_kt_zero_storage_for_state_dict_load)
+
+    def _compute_shared_expert(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        if self._shared_expert_attr is None:
+            return None
+
+        shared_expert = getattr(self, self._shared_expert_attr)
+        shared_output = shared_expert(hidden_states)
+        if self._shared_expert_gate_attr is not None:
+            shared_expert_gate = getattr(self, self._shared_expert_gate_attr)
+            shared_output = torch.sigmoid(shared_expert_gate(hidden_states)) * shared_output
+        return shared_output
+
+    def _refresh_backend_weights(self) -> None:
+        if self._lora_pointers_dirty:
+            self.update_lora_pointers()
+            self._lora_pointers_dirty = False
+
+        if self._full_weight_grad and getattr(self.wrapper, "_kt_full_checkpoint_load_failed", False):
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: a previous KT Full checkpoint load failed; "
+                "reload a valid checkpoint before running forward"
+            )
+        if self._full_weight_grad and getattr(self.wrapper, "_base_weights_dirty", False):
+            with torch.profiler.record_function("kt.sft.base_weight_reload"):
+                self.wrapper.update_base_weights()
+            self.wrapper._base_weights_dirty = False
 
     def _apply(self, fn, recurse=True):
         # Protect experts from device transfer (PEFT LoRA should stay on CPU for KT)
         saved_experts = None
-        experts_attr = getattr(self, '_experts_attr', None)
+        experts_attr = getattr(self, "_experts_attr", None)
 
         if experts_attr is not None and getattr(self, experts_attr, None) is not None:
             saved_experts = getattr(self, experts_attr)
@@ -101,65 +423,95 @@ class KTMoELayerWrapper(nn.Module):
         return result
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        with torch.profiler.record_function("kt.sft.routing"):
+            topk_ids, topk_weights = self._compute_routing(hidden_states)
+        return self._forward_routed(hidden_states, topk_ids, topk_weights)
 
+    def _forward_routed(self, hidden_states, topk_ids, topk_weights):
         import torch.distributed as dist
+
         dist_on = dist.is_initialized() and dist.get_world_size() > 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # Check if we need to use distributed broadcast (only rank 0 has KT kernel)
-        use_broadcast = dist_on and self.wrapper is None
-
-        topk_ids, topk_weights = self._compute_routing(hidden_states)
-
-        train_lora = self._peft_lora_modules is not None and len(self._peft_lora_modules) > 0
+        train_lora = bool(
+            self._kt_managed_lora_enabled
+            or (self._peft_lora_modules is not None and len(self._peft_lora_modules) > 0)
+            or getattr(self, "_fused_expert_lora_params", None)
+        )
+        full_weight_grad = self._full_weight_grad
 
         save_for_backward = (
             self.training
             and torch.is_grad_enabled()
-            and (hidden_states.requires_grad or topk_weights.requires_grad or train_lora)
+            and (hidden_states.requires_grad or topk_weights.requires_grad or train_lora or full_weight_grad)
         )
         use_autograd_path = save_for_backward
+        checkpoint_mode = _checkpoint_hook_mode()
+        checkpoint_action = _activation_checkpoint_action(self._kt_activation_policy, checkpoint_mode)
+        if not dist_on:
+            _validate_activation_checkpoint_phase(
+                self._kt_activation_policy,
+                checkpoint_mode,
+                requires_backward=use_autograd_path,
+            )
+        cache_checkpoint_forward = checkpoint_action == "cache_first_forward"
+        reuse_cached_forward = checkpoint_action == "reuse_recompute"
         save_for_backward_submit = use_autograd_path
-        if _checkpoint_hook_mode() == "first_forward":
+        if checkpoint_mode == "first_forward" and not cache_checkpoint_forward:
             save_for_backward_submit = False
 
-        if train_lora and self._lora_pointers_dirty:
-            self.update_lora_pointers()
-            self._lora_pointers_dirty = False
-
-        gpu_output, all_qlens = self._submit_and_compute_gpu(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            save_for_backward_submit,
-        )
+        with torch.profiler.record_function("kt.sft.submit_and_gpu_experts"):
+            gpu_output, all_qlens = self._submit_and_compute_gpu(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                save_for_backward_submit,
+                checkpoint_mode,
+                checkpoint_action,
+            )
 
         # Use KTMoEFunction whenever backward is needed so KT backward and LoRA
         # gradient paths remain connected.
         if use_autograd_path:
-            lora_ref = hidden_states.new_empty(())
+            # A requires-grad sentinel keeps the custom autograd node alive on
+            # non-rank-0 fused/full ranks that intentionally own no KT params.
+            lora_ref = hidden_states.new_empty((), requires_grad=(train_lora or full_weight_grad))
             if train_lora and self._peft_lora_modules:
+                found_lora_ref = False
                 for expert_loras in self._peft_lora_modules.values():
                     for lora_A, lora_B in expert_loras.values():
-                        if hasattr(lora_A, 'weight') and lora_A.weight.requires_grad:
+                        if hasattr(lora_A, "weight") and lora_A.weight.requires_grad:
                             lora_ref = lora_A.weight
+                            found_lora_ref = True
                             break
-                    if lora_ref.numel() > 0:
+                    if found_lora_ref:
                         break
+            elif train_lora and getattr(self, "_fused_expert_lora_params", None):
+                lora_ref = self._fused_expert_lora_params[0]
+            elif full_weight_grad and self.wrapper is not None:
+                # In full mode, use base weight param as autograd sentinel
+                if self.wrapper.gate_proj_buf is not None:
+                    lora_ref = self.wrapper.gate_proj_buf
 
-            moe_output = KTMoEFunction.apply(
-                hidden_states,
-                topk_ids,
-                topk_weights,
-                self.wrapper,
-                lora_ref,
-                self.hidden_size,
-                self.moe_config.num_experts_per_tok,
-                self.layer_idx,
-                save_for_backward,
-                train_lora,
-                all_qlens,
-            )
+            with torch.profiler.record_function("kt.sft.autograd_apply_and_cpu_sync"):
+                moe_output = KTMoEFunction.apply(
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    self.wrapper,
+                    lora_ref,
+                    self.hidden_size,
+                    self.moe_config.num_experts_per_tok,
+                    self.layer_idx,
+                    save_for_backward,
+                    train_lora,
+                    all_qlens,
+                    cache_checkpoint_forward,
+                    reuse_cached_forward,
+                    # Base weight params for full mode gradient flow
+                    self.wrapper.gate_proj_buf if full_weight_grad and self.wrapper is not None else None,
+                    self.wrapper.up_proj_buf if full_weight_grad and self.wrapper is not None else None,
+                    self.wrapper.down_proj_buf if full_weight_grad and self.wrapper is not None else None,
+                )
         else:
             moe_output = self._sync_forward_output_no_autograd(
                 hidden_states=hidden_states,
@@ -194,24 +546,32 @@ class KTMoELayerWrapper(nn.Module):
             else:
                 all_qlens_list = [int(q) for q in all_qlens]
                 if len(all_qlens_list) != world_size:
-                    raise RuntimeError(
-                        f"all_qlens length mismatch: got {len(all_qlens_list)}, expected {world_size}"
-                    )
+                    raise RuntimeError(f"all_qlens length mismatch: got {len(all_qlens_list)}, expected {world_size}")
             if int(all_qlens_list[rank]) != qlen:
-                raise RuntimeError(
-                    f"Rank {rank} qlen mismatch: local={qlen}, all_qlens[{rank}]={all_qlens_list[rank]}"
-                )
+                raise RuntimeError(f"Rank {rank} qlen mismatch: local={qlen}, all_qlens[{rank}]={all_qlens_list[rank]}")
             total_qlen = sum(all_qlens_list)
 
+            sync_error = None
             if rank == 0:
-                if self.wrapper is None:
-                    raise RuntimeError("Rank0 wrapper is required in distributed KT overlap path.")
-                cpu_output = self.wrapper.sync_forward(output_device=original_device)
-                cpu_output = cpu_output.to(dtype=original_dtype).view(total_qlen, self.hidden_size)
-                offsets = _qlen_offsets(all_qlens_list)
-                scatter_list = [cpu_output[offsets[i] : offsets[i + 1]].contiguous() for i in range(world_size)]
+                try:
+                    if self.wrapper is None:
+                        raise RuntimeError("Rank0 wrapper is required in distributed KT overlap path.")
+                    cpu_output = self.wrapper.sync_forward(output_device=original_device)
+                    cpu_output = cpu_output.to(dtype=original_dtype).view(total_qlen, self.hidden_size)
+                    offsets = _qlen_offsets(all_qlens_list)
+                    scatter_list = [
+                        cpu_output[offsets[i] : offsets[i + 1]].contiguous()
+                        for i in range(world_size)
+                    ]
+                except Exception as exc:
+                    sync_error = exc
             else:
                 scatter_list = None
+            _sync_rank0_exception(
+                sync_error,
+                device=original_device,
+                context=f"Layer {self.layer_idx} CPU inference forward failed",
+            )
 
             output_flat = _dist_scatter_varlen_from_rank0(
                 rank0_chunks=scatter_list,
@@ -234,30 +594,148 @@ class KTMoELayerWrapper(nn.Module):
         return torch.empty(batch_size, seq_len, self.hidden_size, device=original_device, dtype=original_dtype)
 
     def _compute_routing(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Run routing under no_grad to avoid creating autograd nodes whose
-        # SavedVariables become orphan holders inside gradient checkpoint.
-        # The gate is frozen during LoRA fine-tuning and the main gradient
-        # flows through KTMoEFunction.backward()'s grad_input, so the
-        # routing gradient contribution to hidden_states can be safely dropped.
-        with torch.no_grad():
-            router = getattr(self, self._router_attr)
-            if self.router_type == "deepseek_gate":
-                # DeepSeek V3's MoEGate has `assert not self.training` in its noaux_tc
-                # routing path because the HF model is an inference-only port.
-                # For LoRA fine-tuning the router is frozen, so eval() is safe.
+        router = getattr(self, self._router_attr)
+        routing_grad_enabled = torch.is_grad_enabled() and (
+            hidden_states.requires_grad or any(parameter.requires_grad for parameter in router.parameters())
+        )
+        routing_context = nullcontext() if routing_grad_enabled else torch.no_grad()
+
+        def finish(
+            topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if topk_weights.is_floating_point():
+                topk_weights = topk_weights.to(torch.bfloat16)
+            if routing_grad_enabled and not topk_weights.requires_grad:
+                raise RuntimeError(f"Layer {self.layer_idx}: routing weights are detached but gradients are required")
+            return topk_ids, topk_weights
+
+        with routing_context:
+            if self.router_type == "deepseek_gate" and self._original_router is None:
+                # Native fallback; weighted gates use the proxy below so router LoRA stays active.
                 was_training = router.training
                 if was_training:
                     router.eval()
                 router_output = router(hidden_states)
                 if was_training:
                     router.train()
-                if len(router_output) == 2:
-                    topk_ids, topk_weights = router_output
-                else:
-                    topk_ids, topk_weights = router_output[0], router_output[1]
-                if topk_weights.is_floating_point():
-                    topk_weights = topk_weights.to(torch.bfloat16)
-                return topk_ids, topk_weights
+                if not isinstance(router_output, (tuple, list)) or len(router_output) != 2:
+                    raise RuntimeError(
+                        f"Layer {self.layer_idx}: DeepSeek gate must return "
+                        "(topk_ids, topk_weights)"
+                    )
+                topk_ids, topk_weights = router_output
+                return finish(topk_ids, topk_weights)
+
+            # When _original_router is set, self.gate is an nn.Linear wrapper
+            # around the TopKRouter's weight.  Use it (with PEFT LoRA if
+            # applied) for the linear projection, then replicate top-k logic.
+            if self._original_router is not None:
+                orig_router = self._original_router
+                router_logits = router(hidden_states.view(-1, self.hidden_size))
+                if self.router_type == "deepseek_gate":
+                    spec = self._deepseek_routing_spec
+                    if spec is None:
+                        raise RuntimeError(
+                            f"Layer {self.layer_idx}: DeepSeek routing spec was not initialized"
+                        )
+                    router_probs = torch.sigmoid(router_logits.float())
+                    correction_bias = getattr(orig_router, "e_score_correction_bias", None)
+                    if correction_bias is None:
+                        raise RuntimeError(
+                            f"Layer {self.layer_idx}: DeepSeek noaux_tc gate is missing "
+                            "e_score_correction_bias"
+                        )
+
+                    scores_for_choice = router_probs + correction_bias.to(
+                        device=router_probs.device,
+                        dtype=router_probs.dtype,
+                    )
+                    group_scores = (
+                        scores_for_choice.view(
+                            -1,
+                            spec.n_group,
+                            spec.expert_num // spec.n_group,
+                        )
+                        .topk(2, dim=-1)[0]
+                        .sum(dim=-1)
+                    )
+                    group_idx = torch.topk(
+                        group_scores,
+                        k=spec.topk_group,
+                        dim=-1,
+                        sorted=False,
+                    )[1]
+                    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+                    group_mask.scatter_(1, group_idx, True)
+                    score_mask = (
+                        group_mask.unsqueeze(-1)
+                        .expand(
+                            -1,
+                            spec.n_group,
+                            spec.expert_num // spec.n_group,
+                        )
+                        .reshape(-1, spec.expert_num)
+                    )
+                    scores_for_choice = scores_for_choice.masked_fill(
+                        ~score_mask,
+                        0.0,
+                    )
+                    topk_ids = torch.topk(
+                        scores_for_choice,
+                        k=spec.top_k,
+                        dim=-1,
+                        sorted=False,
+                    )[1]
+                    topk_weights = router_probs.gather(1, topk_ids)
+                    if spec.norm_topk_prob:
+                        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+                    topk_weights = topk_weights * spec.routed_scaling_factor
+                    return finish(topk_ids, topk_weights)
+
+                if self.router_type == "glm4_moe_gate":
+                    router_probs = torch.sigmoid(router_logits.float())
+                    correction_bias = getattr(orig_router, "e_score_correction_bias", None)
+                    if correction_bias is None:
+                        router_logits_for_choice = router_probs
+                    else:
+                        router_logits_for_choice = router_probs + correction_bias.to(
+                            device=router_probs.device,
+                            dtype=router_probs.dtype,
+                        )
+                    n_group = getattr(orig_router, "n_group", 1)
+                    topk_group = getattr(orig_router, "topk_group", n_group)
+                    expert_num = self.moe_config.expert_num
+                    group_scores = (
+                        router_logits_for_choice.view(-1, n_group, expert_num // n_group)
+                        .topk(2, dim=-1)[0]
+                        .sum(dim=-1)
+                    )
+                    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
+                    group_mask = torch.zeros_like(group_scores)
+                    group_mask.scatter_(1, group_idx, 1)
+                    score_mask = (
+                        group_mask.unsqueeze(-1)
+                        .expand(-1, n_group, expert_num // n_group)
+                        .reshape(-1, expert_num)
+                    )
+                    scores_for_choice = router_logits_for_choice.masked_fill(~score_mask.bool(), 0.0)
+                    top_k = getattr(orig_router, "top_k", self.moe_config.num_experts_per_tok)
+                    topk_ids = torch.topk(scores_for_choice, k=top_k, dim=-1, sorted=False)[1]
+                    topk_weights = router_probs.gather(1, topk_ids)
+                    if getattr(orig_router, "norm_topk_prob", True):
+                        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+                    topk_weights = topk_weights * getattr(orig_router, "routed_scaling_factor", 1.0)
+                    return finish(topk_ids, topk_weights)
+
+                router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
+                top_k = getattr(orig_router, "top_k", self.moe_config.num_experts_per_tok)
+                norm_topk_prob = getattr(orig_router, "norm_topk_prob", True)
+                topk_weights, topk_ids = torch.topk(router_probs, top_k, dim=-1)
+                if norm_topk_prob:
+                    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+                topk_weights = topk_weights.to(router_logits.dtype)
+                return finish(topk_ids, topk_weights)
 
             router_output = router(hidden_states.view(-1, self.hidden_size))
             # transformers v5 TopKRouter returns (router_logits, router_scores, router_indices)
@@ -265,17 +743,14 @@ class KTMoELayerWrapper(nn.Module):
             if isinstance(router_output, tuple):
                 if len(router_output) >= 3:
                     _logits, topk_weights, topk_ids = router_output[0], router_output[1], router_output[2]
-                    if topk_weights.is_floating_point():
-                        topk_weights = topk_weights.to(torch.bfloat16)
-                    return topk_ids, topk_weights
+                    return finish(topk_ids, topk_weights)
                 router_output = router_output[0]
 
             router_logits = router_output
             routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
             topk_weights, topk_ids = torch.topk(routing_weights, self.moe_config.num_experts_per_tok, dim=-1)
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(torch.bfloat16)
-            return topk_ids, topk_weights
+            return finish(topk_ids, topk_weights)
 
     def _submit_and_compute_gpu(
         self,
@@ -283,6 +758,8 @@ class KTMoELayerWrapper(nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         save_for_backward: bool,
+        checkpoint_phase: str = "none",
+        checkpoint_action: str = "normal",
     ) -> tuple[torch.Tensor | None, list[int] | None]:
         import torch.distributed as dist
 
@@ -295,67 +772,169 @@ class KTMoELayerWrapper(nn.Module):
         world_size = dist.get_world_size() if dist_on else 1
 
         qlen = batch_size * seq_len
+        reuse_cached_forward = checkpoint_action == "reuse_recompute"
 
         if dist_on:
-            all_qlens = _all_gather_qlens(qlen, original_device, world_size)
+            ownership_error = None
+            try:
+                wrapped_world_size = int(getattr(self, "_kt_world_size_at_wrap", world_size))
+                if wrapped_world_size != world_size:
+                    raise RuntimeError(
+                        f"KT wrapper was created for world_size={wrapped_world_size}, "
+                        f"but the active process group has world_size={world_size}"
+                    )
+                if rank == 0 and self.wrapper is None:
+                    raise RuntimeError("rank 0 does not own the KT backend")
+                if rank != 0 and self.wrapper is not None:
+                    raise RuntimeError(f"rank {rank} unexpectedly owns a KT backend")
+            except Exception as exc:
+                ownership_error = exc
+
+            all_qlens = _all_gather_checkpoint_state(
+                qlen,
+                layer_idx=self.layer_idx,
+                phase=checkpoint_phase,
+                action=checkpoint_action,
+                cpu_policy=self._kt_activation_policy.cpu,
+                gpu_policy=self._kt_activation_policy.gpu,
+                owner_valid=ownership_error is None,
+                device=original_device,
+                world_size=world_size,
+            )
             if int(all_qlens[rank]) != qlen:
+                raise RuntimeError(f"Rank {rank} qlen mismatch: local={qlen}, all_qlens[{rank}]={all_qlens[rank]}")
+            _validate_activation_checkpoint_phase(
+                self._kt_activation_policy,
+                checkpoint_phase,
+                requires_backward=save_for_backward,
+            )
+            if ownership_error is not None:
                 raise RuntimeError(
-                    f"Rank {rank} qlen mismatch: local={qlen}, all_qlens[{rank}]={all_qlens[rank]}"
-                )
+                    f"Layer {self.layer_idx} KT ownership validation failed: {ownership_error}"
+                ) from ownership_error
             total_qlen = sum(all_qlens)
 
-            hs_flat = hidden_states.view(qlen, self.hidden_size).contiguous()
-            expert_ids = topk_ids.view(qlen, self.moe_config.num_experts_per_tok).contiguous()
-            weights = topk_weights.view(qlen, self.moe_config.num_experts_per_tok).contiguous()
-
-            submit_hs = hs_flat.detach()
-            submit_ids = expert_ids.detach()
-            submit_wts = weights.detach()
-
-            gathered_hs = _dist_gather_varlen_to_rank0(
-                submit_hs,
-                all_qlens=all_qlens,
-                rank=rank,
-                world_size=world_size,
-            )
-            gathered_ids = _dist_gather_varlen_to_rank0(
-                submit_ids,
-                all_qlens=all_qlens,
-                rank=rank,
-                world_size=world_size,
-            )
-            gathered_wts = _dist_gather_varlen_to_rank0(
-                submit_wts,
-                all_qlens=all_qlens,
-                rank=rank,
-                world_size=world_size,
-            )
-
+            refresh_error = None
             if rank == 0:
-                all_hs = torch.cat(gathered_hs, dim=0)
-                all_ids = torch.cat(gathered_ids, dim=0)
-                all_wts = torch.cat(gathered_wts, dim=0)
-                self.wrapper.submit_forward(
-                    all_hs,
-                    all_ids,
-                    all_wts,
-                    save_for_backward=save_for_backward,
+                try:
+                    self._refresh_backend_weights()
+                    if checkpoint_action == "cache_first_forward":
+                        validate_empty = getattr(self.wrapper, "validate_checkpoint_cache_empty", None)
+                        if validate_empty is not None:
+                            validate_empty()
+                        elif getattr(self.wrapper, "_kt_has_cached_forward", False):
+                            raise RuntimeError(
+                                "Checkpoint forward cache is still live before a new first forward"
+                            )
+                except Exception as exc:
+                    refresh_error = exc
+
+            if reuse_cached_forward:
+                cache_error = refresh_error
+                if rank == 0 and cache_error is None:
+                    try:
+                        if self.wrapper is None:
+                            raise RuntimeError("Rank 0 does not own the KT backend")
+                        validate_cache = getattr(self.wrapper, "validate_checkpoint_output", None)
+                        if validate_cache is not None:
+                            validate_cache(total_qlen)
+                        elif not getattr(self.wrapper, "_kt_has_cached_forward", False):
+                            raise RuntimeError("No cached checkpoint forward output is available")
+                    except Exception as exc:
+                        cache_error = exc
+                if rank == 0 and cache_error is not None:
+                    _poison_checkpoint_cache(self.wrapper, cache_error)
+                _sync_rank0_exception(
+                    cache_error,
+                    device=original_device,
+                    context=f"Layer {self.layer_idx} checkpoint cache validation failed",
+                )
+            else:
+                hs_flat = hidden_states.view(qlen, self.hidden_size).contiguous()
+                expert_ids = topk_ids.view(qlen, self.moe_config.num_experts_per_tok).contiguous()
+                weights = topk_weights.view(qlen, self.moe_config.num_experts_per_tok).contiguous()
+
+                gathered_hs = _dist_gather_varlen_to_rank0(
+                    hs_flat.detach(),
+                    all_qlens=all_qlens,
+                    rank=rank,
+                    world_size=world_size,
+                )
+                gathered_ids = _dist_gather_varlen_to_rank0(
+                    expert_ids.detach(),
+                    all_qlens=all_qlens,
+                    rank=rank,
+                    world_size=world_size,
+                )
+                gathered_wts = _dist_gather_varlen_to_rank0(
+                    weights.detach(),
+                    all_qlens=all_qlens,
+                    rank=rank,
+                    world_size=world_size,
                 )
 
-            # Keep shared/lora experts local to avoid qlen_max-style amplification.
-            gpu_output = None
-            if self.shared_experts is not None:
-                gpu_output = self.shared_experts(hidden_states)
-                gpu_output = gpu_output.to(dtype=original_dtype)
+                submit_error = refresh_error
+                if rank == 0 and submit_error is None:
+                    try:
+                        if self.wrapper is None:
+                            raise RuntimeError("Rank 0 does not own the KT backend")
+                        self.wrapper.submit_forward(
+                            torch.cat(gathered_hs, dim=0),
+                            torch.cat(gathered_ids, dim=0),
+                            torch.cat(gathered_wts, dim=0),
+                            save_for_backward=save_for_backward,
+                        )
+                    except Exception as exc:
+                        submit_error = exc
+                if rank == 0 and submit_error is not None and checkpoint_action == "cache_first_forward":
+                    _poison_checkpoint_cache(self.wrapper, submit_error)
+                _sync_rank0_exception(
+                    submit_error,
+                    device=original_device,
+                    context=f"Layer {self.layer_idx} CPU forward submission failed",
+                )
 
-            if self.lora_experts is not None:
-                lora_out = self.lora_experts(hidden_states)
-                gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
+            gpu_output = None
+            if self._shared_expert_attr is not None or self.lora_experts is not None:
+                gpu_error = None
+                try:
+                    gpu_output = self._compute_shared_expert(hidden_states)
+                    if gpu_output is not None:
+                        gpu_output = gpu_output.to(dtype=original_dtype)
+
+                    if self.lora_experts is not None:
+                        lora_out = self.lora_experts(hidden_states)
+                        gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
+                except Exception as exc:
+                    gpu_error = exc
+                try:
+                    _sync_any_rank_exception(
+                        gpu_error,
+                        device=original_device,
+                        context=f"Layer {self.layer_idx} local GPU expert forward failed",
+                    )
+                except Exception as exc:
+                    if checkpoint_action in ("cache_first_forward", "reuse_recompute"):
+                        _poison_checkpoint_cache(self.wrapper, exc)
+                    raise
 
             return gpu_output, all_qlens
 
         else:
             # ---- Single-GPU path: submit + GPU compute ----
+            self._refresh_backend_weights()
+            if checkpoint_action == "cache_first_forward":
+                try:
+                    validate_empty = getattr(self.wrapper, "validate_checkpoint_cache_empty", None)
+                    if validate_empty is not None:
+                        validate_empty()
+                    elif getattr(self.wrapper, "_kt_has_cached_forward", False):
+                        raise RuntimeError(
+                            "Checkpoint forward cache is still live before a new first forward"
+                        )
+                except Exception as exc:
+                    _poison_checkpoint_cache(self.wrapper, exc)
+                    raise
             input_flat = hidden_states.view(qlen, self.hidden_size)
             expert_ids = topk_ids.view(qlen, self.moe_config.num_experts_per_tok)
             weights = topk_weights.view(qlen, self.moe_config.num_experts_per_tok)
@@ -364,20 +943,35 @@ class KTMoELayerWrapper(nn.Module):
             submit_hs = input_flat.detach()
             submit_ids = expert_ids.detach()
             submit_wts = weights.detach()
-            self.wrapper.submit_forward(
-                submit_hs,
-                submit_ids,
-                submit_wts,
-                save_for_backward=save_for_backward,
-            )
+            if reuse_cached_forward:
+                validate_cache = getattr(self.wrapper, "validate_checkpoint_output", None)
+                if validate_cache is not None:
+                    validate_cache(qlen)
+                elif not getattr(self.wrapper, "_kt_has_cached_forward", False):
+                    raise RuntimeError("No cached checkpoint forward output is available")
+            else:
+                try:
+                    self.wrapper.submit_forward(
+                        submit_hs,
+                        submit_ids,
+                        submit_wts,
+                        save_for_backward=save_for_backward,
+                    )
+                except Exception as exc:
+                    if checkpoint_action == "cache_first_forward":
+                        _poison_checkpoint_cache(self.wrapper, exc)
+                    raise
 
             # GPU compute: shared_experts + lora_experts
-            gpu_output = None
-            if self.shared_experts is not None:
-                gpu_output = self.shared_experts(hidden_states)
-            if self.lora_experts is not None:
-                lora_out = self.lora_experts(hidden_states)
-                gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
+            try:
+                gpu_output = self._compute_shared_expert(hidden_states)
+                if self.lora_experts is not None:
+                    lora_out = self.lora_experts(hidden_states)
+                    gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
+            except Exception as exc:
+                if checkpoint_action in ("cache_first_forward", "reuse_recompute"):
+                    _poison_checkpoint_cache(self.wrapper, exc)
+                raise
 
             return gpu_output, None
 
@@ -397,3 +991,23 @@ class KTMoELayerWrapper(nn.Module):
         # PEFT weights are views into wrapper's contiguous buffers —
         # optimizer.step() already updated them in-place, just re-sync to C++.
         self.wrapper.update_lora_weights()
+
+
+class KTRoutedExpertsWrapper(KTMoELayerWrapper):
+    """Execute only experts; routing and shared experts stay in the model."""
+
+    def __init__(self, original_moe, **kwargs):
+        config = kwargs["moe_config"]
+        expert_container = nn.Module()
+        expert_container.add_module(config.experts_attr, getattr(original_moe, config.experts_attr))
+        kwargs["moe_config"] = replace(config, has_shared_experts=False)
+        super().__init__(original_moe=expert_container, **kwargs)
+        self._is_kt_routed_experts_wrapper = True
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        if hidden_states.ndim != 2 or hidden_states.shape[-1] != self.hidden_size:
+            raise ValueError("KT routed experts require [tokens, hidden_size] activations")
+        expected = (hidden_states.shape[0], self.moe_config.num_experts_per_tok)
+        if tuple(top_k_index.shape) != expected or tuple(top_k_weights.shape) != expected:
+            raise ValueError(f"KT routed experts require routing tensors shaped {expected}")
+        return self._forward_routed(hidden_states.unsqueeze(0), top_k_index, top_k_weights).squeeze(0)

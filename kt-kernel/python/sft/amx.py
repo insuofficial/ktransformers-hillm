@@ -9,6 +9,8 @@ this file handles weight loading, LoRA init, and C++ task construction.
 from __future__ import annotations
 
 import ctypes
+import logging
+import math
 import os
 import glob as _glob
 import torch
@@ -16,7 +18,9 @@ from typing import Optional, List
 
 from kt_kernel_ext.moe import MOESFTConfig
 
-from ..utils.loader import BF16SafeTensorLoader, SafeTensorLoader
+logger = logging.getLogger(__name__)
+
+from ..utils.loader import BF16SafeTensorLoader, MXFP4SafeTensorLoader, SafeTensorLoader
 
 try:
     from kt_kernel_ext.moe import (
@@ -38,7 +42,31 @@ except (ImportError, AttributeError):
     AMXInt8_SFT_MOE_SkipLoRA = None
     AMXInt4_SFT_MOE_SkipLoRA = None
 
-from .base import BaseSFTMoEWrapper, KExpertsSFTBuffer
+try:
+    from kt_kernel_ext.moe import AMXFP8_SFT_MOE
+except (ImportError, AttributeError):
+    AMXFP8_SFT_MOE = None
+
+try:
+    from kt_kernel_ext.moe import AMXInt4_KGroup_SFT_MOE
+except (ImportError, AttributeError):
+    AMXInt4_KGroup_SFT_MOE = None
+
+try:
+    from kt_kernel_ext.moe import MXFP4_SFT_MOE
+except (ImportError, AttributeError):
+    MXFP4_SFT_MOE = None
+
+from .base import BaseSFTMoEWrapper, KExpertsSFTBuffer, _supports_authoritative_optimizer_grads
+from .backend import (
+    get_mxfp4_runtime,
+    get_rawint4_runtime,
+    is_fp8_sft_method,
+    is_int8_sft_method,
+    is_mxfp4_sft_method,
+    is_rawint4_sft_method,
+)
+from .weights import BlockFP8ExpertWeights, RAWINT4ExpertWeights
 
 _AMX_M_STEP = 32
 
@@ -46,8 +74,13 @@ _AMX_M_STEP = 32
 # Mapping from method string to C++ SFT MOE class
 _SFT_METHOD_TO_CLASS = {
     "AMXBF16_SFT": AMXBF16_SFT_MOE,
+    "AMXFP8_SFT": AMXFP8_SFT_MOE,
+    "MXFP4_SFT": MXFP4_SFT_MOE,
+    "INT8_SFT": AMXInt8_SFT_MOE,
     "AMXINT8_SFT": AMXInt8_SFT_MOE,
     "AMXINT4_SFT": AMXInt4_SFT_MOE,
+    "RAWINT4_SFT": AMXInt4_KGroup_SFT_MOE,
+    "AMXINT4_KGroup_SFT": AMXInt4_KGroup_SFT_MOE,
     "AMXBF16_SFT_SkipLoRA": AMXBF16_SFT_MOE_SkipLoRA,
     "AMXINT8_SFT_SkipLoRA": AMXInt8_SFT_MOE_SkipLoRA,
     "AMXINT4_SFT_SkipLoRA": AMXInt4_SFT_MOE_SkipLoRA,
@@ -58,7 +91,7 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
     """
     AMX-based SFT MoE wrapper.
 
-    Supports BF16, INT8, INT4, and SkipLoRA variants.
+    Supports BF16, native block-FP8/MXFP4, INT8, INT4, and SkipLoRA variants.
     Forward/backward buffer management is in BaseSFTMoEWrapper;
     this class implements weight loading and C++ task construction.
     """
@@ -77,16 +110,23 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
         chunked_prefill_size: int,
         lora_rank: int = 16,
         lora_alpha: float = 32.0,
+        lora_dropout: float = 0.0,
         max_cache_depth: int = 1,
         method: str = "AMXBF16_SFT",
         group_size: int = 128,
         zero_point: bool = True,
+        full_weight_grad: bool = False,
+        swiglu_limit: float = 0.0,
     ):
-        if not _HAS_AMX_SFT_SUPPORT:
+        if not _HAS_AMX_SFT_SUPPORT and not (is_mxfp4_sft_method(method) or is_rawint4_sft_method(method)):
             raise RuntimeError(
                 "AMX SFT backend not available. kt_kernel_ext was not compiled with AMX SFT support.\n"
                 "Please recompile with AMX SFT enabled."
             )
+        if is_mxfp4_sft_method(method):
+            get_mxfp4_runtime()
+        if is_rawint4_sft_method(method):
+            get_rawint4_runtime()
 
         super().__init__(
             layer_idx=layer_idx,
@@ -101,13 +141,82 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
             chunked_prefill_size=chunked_prefill_size,
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
             max_cache_depth=max_cache_depth,
+            full_weight_grad=full_weight_grad,
         )
 
         self.method = method
+        self._is_rawint4 = is_rawint4_sft_method(method)
         self._is_skip_lora = "SkipLoRA" in method
+        self._uses_authoritative_optimizer_grads = _supports_authoritative_optimizer_grads(
+            method,
+            self.num_gpu_experts,
+            full_weight_grad=self._full_weight_grad,
+            lora_rank=self.lora_rank,
+        )
         self.group_size = group_size
         self.zero_point = zero_point
+        self.swiglu_limit = float(swiglu_limit)
+
+        if not (is_mxfp4_sft_method(method) or is_rawint4_sft_method(method)) and self.swiglu_limit != 0.0:
+            raise ValueError(f"swiglu_limit is only supported by MXFP4_SFT/RAWINT4_SFT, got {method!r}")
+        if is_mxfp4_sft_method(method):
+            if self._full_weight_grad or self.lora_rank <= 0:
+                raise ValueError("MXFP4_SFT supports frozen-base LoRA only")
+            if self.num_gpu_experts != 0:
+                raise ValueError("MXFP4_SFT requires all routed experts on CPU")
+            if self.group_size != 32 or self.zero_point:
+                raise ValueError("MXFP4_SFT requires group_size=32 and zero_point=False")
+            if self.hidden_size % 32 or self.moe_intermediate_size % 32:
+                raise ValueError("MXFP4_SFT requires hidden_size and moe_intermediate_size divisible by 32")
+            if self.threadpool_count not in (1, 2):
+                raise ValueError("MXFP4_SFT currently supports threadpool_count 1 or 2")
+            if self.moe_intermediate_size % self.threadpool_count:
+                raise ValueError("MXFP4_SFT requires moe_intermediate_size divisible by threadpool_count")
+            if (self.moe_intermediate_size // self.threadpool_count) % 32:
+                raise ValueError("MXFP4_SFT requires every TP intermediate slice divisible by 32")
+            if not math.isfinite(self.swiglu_limit) or self.swiglu_limit <= 0.0:
+                raise ValueError("MXFP4_SFT requires a finite positive swiglu_limit")
+
+        if is_fp8_sft_method(method):
+            if self._full_weight_grad or self.lora_rank <= 0:
+                raise ValueError("AMXFP8_SFT supports frozen-base LoRA only")
+            if self.num_gpu_experts != 0:
+                raise ValueError("AMXFP8_SFT requires all routed experts on CPU")
+            if self.hidden_size % 128 or self.moe_intermediate_size % 128:
+                raise ValueError("AMXFP8_SFT requires hidden_size and moe_intermediate_size " "divisible by 128")
+            if self.threadpool_count < 1 or self.moe_intermediate_size % self.threadpool_count:
+                raise ValueError("AMXFP8_SFT requires moe_intermediate_size divisible by " "threadpool_count")
+            if (self.moe_intermediate_size // self.threadpool_count) % 128:
+                raise ValueError("AMXFP8_SFT requires every TP intermediate slice divisible by 128")
+            self.group_size = 128
+            self.zero_point = False
+
+        if is_rawint4_sft_method(self.method):
+            if self._full_weight_grad:
+                raise ValueError("RAWINT4 SFT supports frozen-base LoRA only")
+            if self.lora_rank != 8:
+                raise ValueError("RAWINT4 SFT v1 requires LoRA rank 8")
+            if self.lora_dropout != 0.0:
+                raise ValueError("RAWINT4 SFT v1 requires LoRA dropout 0")
+            if self._is_skip_lora:
+                raise ValueError("RAWINT4 SFT v1 does not support SkipLoRA")
+            if self.num_gpu_experts != 0:
+                raise ValueError("RAWINT4 SFT requires all routed experts on CPU")
+            if self.threadpool_count not in {1, 2}:
+                raise ValueError("RAWINT4 SFT v1 supports TP1/TP2 only")
+            if self.hidden_size % 32 or self.moe_intermediate_size % 32:
+                raise ValueError("RAWINT4 SFT requires hidden_size and moe_intermediate_size " "divisible by 32")
+            if (
+                self.moe_intermediate_size % self.threadpool_count
+                or (self.moe_intermediate_size // self.threadpool_count) % 32
+            ):
+                raise ValueError("RAWINT4 SFT requires every TP intermediate slice divisible by 32")
+            if not math.isfinite(self.swiglu_limit) or self.swiglu_limit < 0.0:
+                raise ValueError("RAWINT4 SFT requires a finite non-negative swiglu_limit")
+            self.group_size = 32
+            self.zero_point = False
 
         if method not in _SFT_METHOD_TO_CLASS:
             raise ValueError(f"Unknown SFT method: {method}. Supported: {list(_SFT_METHOD_TO_CLASS.keys())}")
@@ -119,6 +228,9 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
         self.gate_proj: Optional[torch.Tensor] = None
         self.up_proj: Optional[torch.Tensor] = None
         self.down_proj: Optional[torch.Tensor] = None
+        self.gate_scale: Optional[torch.Tensor] = None
+        self.up_scale: Optional[torch.Tensor] = None
+        self.down_scale: Optional[torch.Tensor] = None
 
         self._moe_class = moe_class
 
@@ -135,42 +247,109 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
             save_for_backward,
         )
 
-    def _make_backward_task(self, buffer: KExpertsSFTBuffer):
+    def _make_backward_task(
+        self,
+        buffer: KExpertsSFTBuffer,
+        accumulate_optimizer_grads: bool = False,
+        optimizer_grad_scale: float = 1.0,
+    ):
         if self._is_skip_lora:
             return self.moe.backward_task(
                 buffer.grad_output_cpu.data_ptr(),
                 buffer.grad_input_cpu.data_ptr(),
-                0, 0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
                 buffer.grad_weights.data_ptr(),
+                0,
+                0,
+                0,  # grad_gate_proj, grad_up_proj, grad_down_proj
             )
-        return self.moe.backward_task(
+
+        # Base weight grad pointers (nullptr if not in full mode)
+        grad_gate_proj_ptr = (
+            self.grad_gate_proj_buf.data_ptr() if self._full_weight_grad and self.grad_gate_proj_buf is not None else 0
+        )
+        grad_up_proj_ptr = (
+            self.grad_up_proj_buf.data_ptr() if self._full_weight_grad and self.grad_up_proj_buf is not None else 0
+        )
+        grad_down_proj_ptr = (
+            self.grad_down_proj_buf.data_ptr() if self._full_weight_grad and self.grad_down_proj_buf is not None else 0
+        )
+
+        backward_args = (
             buffer.grad_output_cpu.data_ptr(),
             buffer.grad_input_cpu.data_ptr(),
-            self.grad_gate_lora_a.data_ptr(),
-            self.grad_gate_lora_b.data_ptr(),
-            self.grad_up_lora_a.data_ptr(),
-            self.grad_up_lora_b.data_ptr(),
-            self.grad_down_lora_a.data_ptr(),
-            self.grad_down_lora_b.data_ptr(),
+            self.grad_gate_lora_a.data_ptr() if self.lora_rank > 0 else 0,
+            self.grad_gate_lora_b.data_ptr() if self.lora_rank > 0 else 0,
+            self.grad_up_lora_a.data_ptr() if self.lora_rank > 0 else 0,
+            self.grad_up_lora_b.data_ptr() if self.lora_rank > 0 else 0,
+            self.grad_down_lora_a.data_ptr() if self.lora_rank > 0 else 0,
+            self.grad_down_lora_b.data_ptr() if self.lora_rank > 0 else 0,
             buffer.grad_weights.data_ptr(),
+            grad_gate_proj_ptr,
+            grad_up_proj_ptr,
+            grad_down_proj_ptr,
         )
+        if (
+            self._uses_authoritative_optimizer_grads
+            or bool(accumulate_optimizer_grads)
+            or float(optimizer_grad_scale) != 1.0
+        ):
+            return self.moe.backward_task(
+                *backward_args,
+                bool(accumulate_optimizer_grads),
+                float(optimizer_grad_scale),
+            )
+        return self.moe.backward_task(*backward_args)
 
     # ========== Weight loading ==========
 
     def load_weights(self, physical_to_logical_map_cpu: torch.Tensor) -> None:
         if self._weights_loaded:
+            if is_mxfp4_sft_method(self.method):
+                raise RuntimeError("MXFP4_SFT weights are immutable and already loaded")
             return
 
         if physical_to_logical_map_cpu is None:
             physical_to_logical_map_cpu = torch.arange(self.num_experts, dtype=torch.int64)
-        self._physical_to_logical_map_cpu = physical_to_logical_map_cpu.to(
-            dtype=torch.int64, device="cpu"
-        ).contiguous()
-        if self._physical_to_logical_map_cpu.numel() < self.num_experts:
+        strict_rawint4_map = bool(getattr(self, "_is_rawint4", False))
+        if strict_rawint4_map:
+            if not isinstance(physical_to_logical_map_cpu, torch.Tensor):
+                raise TypeError("physical_to_logical_map_cpu must be a torch.Tensor")
+            if physical_to_logical_map_cpu.dtype not in {torch.int32, torch.int64}:
+                raise ValueError(
+                    "physical_to_logical_map_cpu must use an integer dtype, "
+                    f"got {physical_to_logical_map_cpu.dtype}."
+                )
+        self._physical_to_logical_map_cpu = (
+            physical_to_logical_map_cpu.to(dtype=torch.int64, device="cpu").reshape(-1).contiguous()
+        )
+        if strict_rawint4_map and self._physical_to_logical_map_cpu.numel() != self.num_experts:
+            raise ValueError(
+                "physical_to_logical_map_cpu must contain exactly "
+                f"{self.num_experts} entries, got {self._physical_to_logical_map_cpu.numel()}."
+            )
+        if not strict_rawint4_map and self._physical_to_logical_map_cpu.numel() < self.num_experts:
             raise ValueError(
                 "physical_to_logical_map_cpu must contain at least "
                 f"{self.num_experts} entries, got {self._physical_to_logical_map_cpu.numel()}."
             )
+        expected_experts = torch.arange(self.num_experts, dtype=torch.int64)
+        if strict_rawint4_map and not torch.equal(self._physical_to_logical_map_cpu.sort().values, expected_experts):
+            raise ValueError(
+                "physical_to_logical_map_cpu must be a permutation of "
+                f"[0, {self.num_experts}); got {self._physical_to_logical_map_cpu.tolist()}."
+            )
+        if is_mxfp4_sft_method(self.method):
+            logical_experts = self._physical_to_logical_map_cpu[: self.num_experts].tolist()
+            if sorted(logical_experts) != list(range(self.num_experts)):
+                raise ValueError(
+                    "MXFP4_SFT physical_to_logical_map_cpu must be a permutation of " f"[0, {self.num_experts})."
+                )
 
         if self.gate_proj is None and not getattr(self, "_use_projs_path", False):
             self._load_base_weights_from_file()
@@ -182,12 +361,16 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
         config.intermediate_size = self.moe_intermediate_size
         config.lora_rank = self.lora_rank
         config.lora_alpha = self.lora_alpha
+        config.lora_dropout = self.lora_dropout
         config.max_cache_depth = self.max_cache_depth
         config.max_len = self._aligned_max_len()
         config.layer_idx = self.layer_idx
         config.share_backward_bb = getattr(self, "share_backward_bb", False)
         config.share_cache_pool = getattr(self, "share_cache_pool", False)
+        config.full_weight_grad = self._full_weight_grad
+        config.authoritative_optimizer_grads = self._uses_authoritative_optimizer_grads
         config.physical_to_logical_map = self._physical_to_logical_map_cpu.data_ptr()
+        config.swiglu_limit = self.swiglu_limit
 
         if getattr(self, "_use_kt_direct_load", False):
             config.load = True
@@ -214,6 +397,10 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
             config.gate_proj = self.gate_proj.data_ptr()
             config.up_proj = self.up_proj.data_ptr()
             config.down_proj = self.down_proj.data_ptr()
+            if getattr(self, "_use_rawint4_tensor_path", False):
+                config.gate_scale = self.gate_scale.data_ptr()
+                config.up_scale = self.up_scale.data_ptr()
+                config.down_scale = self.down_scale.data_ptr()
 
         if self._lora_initialized:
             config.gate_lora_a = self.gate_lora_a.data_ptr()
@@ -225,9 +412,26 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
 
         config.pool = self.cpu_infer.backend_
 
-        if self.method in ("AMXINT4_KGroup_SFT", "AMXINT4_1KGroup_SFT"):
+        if is_rawint4_sft_method(self.method):
+            config.quant_config.bits = 4
             config.quant_config.group_size = self.group_size
             config.quant_config.zero_point = self.zero_point
+        elif is_fp8_sft_method(self.method):
+            config.quant_config.bits = 8
+            config.quant_config.group_size = 128
+            config.quant_config.zero_point = False
+        elif is_mxfp4_sft_method(self.method):
+            config.quant_config.bits = 4
+            config.quant_config.group_size = 32
+            config.quant_config.zero_point = False
+
+        # Release old C++ MOE object before creating a new one to avoid memory leak
+        old_moe = getattr(self, "moe", None)
+        if old_moe is not None:
+            del old_moe
+            import gc
+
+            gc.collect()
 
         self.moe = self._moe_class(config)
 
@@ -239,9 +443,14 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
             self.cpu_infer.sync()
 
         # Release Python-side weight tensors (C++ copied them)
-        self.gate_proj = None
-        self.up_proj = None
-        self.down_proj = None
+        # In full_weight_grad mode, keep them for nn.Parameter initialization
+        if not self._full_weight_grad:
+            self.gate_proj = None
+            self.up_proj = None
+            self.down_proj = None
+            self.gate_scale = None
+            self.up_scale = None
+            self.down_scale = None
 
         if getattr(self, "_bf16_gate_proj", None) is not None:
             self._bf16_gate_proj = None
@@ -250,18 +459,34 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
 
         if getattr(self, "_use_projs_path", False):
             for attr in [
-                "_gate_weights_per_numa", "_up_weights_per_numa", "_down_weights_per_numa",
-                "_gate_scales_per_numa", "_up_scales_per_numa", "_down_scales_per_numa",
-                "_gate_projs_ptrs", "_up_projs_ptrs", "_down_projs_ptrs",
-                "_gate_scale_ptrs", "_up_scale_ptrs", "_down_scale_ptrs",
+                "_gate_weights_per_numa",
+                "_up_weights_per_numa",
+                "_down_weights_per_numa",
+                "_gate_scales_per_numa",
+                "_up_scales_per_numa",
+                "_down_scales_per_numa",
+                "_gate_projs_ptrs",
+                "_up_projs_ptrs",
+                "_down_projs_ptrs",
+                "_gate_scale_ptrs",
+                "_up_scale_ptrs",
+                "_down_scale_ptrs",
             ]:
                 setattr(self, attr, None)
             if getattr(self, "_has_bwd_projs", False):
                 for attr in [
-                    "_gate_bwd_weights_per_numa", "_up_bwd_weights_per_numa", "_down_bwd_weights_per_numa",
-                    "_gate_bwd_scales_per_numa", "_up_bwd_scales_per_numa", "_down_bwd_scales_per_numa",
-                    "_gate_bwd_projs_ptrs", "_up_bwd_projs_ptrs", "_down_bwd_projs_ptrs",
-                    "_gate_bwd_scale_ptrs", "_up_bwd_scale_ptrs", "_down_bwd_scale_ptrs",
+                    "_gate_bwd_weights_per_numa",
+                    "_up_bwd_weights_per_numa",
+                    "_down_bwd_weights_per_numa",
+                    "_gate_bwd_scales_per_numa",
+                    "_up_bwd_scales_per_numa",
+                    "_down_bwd_scales_per_numa",
+                    "_gate_bwd_projs_ptrs",
+                    "_up_bwd_projs_ptrs",
+                    "_down_bwd_projs_ptrs",
+                    "_gate_bwd_scale_ptrs",
+                    "_up_bwd_scale_ptrs",
+                    "_down_bwd_scale_ptrs",
                 ]:
                     setattr(self, attr, None)
 
@@ -274,11 +499,226 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
         down_proj: torch.Tensor,
         physical_to_logical_map_cpu: torch.Tensor,
     ) -> None:
+        if is_rawint4_sft_method(self.method):
+            raise ValueError(
+                "RAWINT4 SFT accepts packed weights plus BF16 group scales only; " "use load_rawint4_weights()"
+            )
+        if is_fp8_sft_method(self.method):
+            raise ValueError("AMXFP8_SFT accepts raw per-expert E4M3 weights only; " "use load_block_fp8_weights()")
+        if is_mxfp4_sft_method(self.method):
+            raise ValueError(
+                "MXFP4_SFT accepts native packed E2M1 weights and UE8M0 scales only; " "use load_mxfp4_weights()"
+            )
+        if is_int8_sft_method(self.method):
+            raise ValueError(
+                "INT8_SFT accepts pre-quantized .kt weights only; " "online tensor conversion is not supported"
+            )
         self.gate_proj = gate_proj.contiguous()
         self.up_proj = up_proj.contiguous()
         self.down_proj = down_proj.contiguous()
         self.load_weights(physical_to_logical_map_cpu)
         del gate_proj, up_proj, down_proj
+
+    def load_rawint4_weights(
+        self,
+        weights: RAWINT4ExpertWeights,
+        physical_to_logical_map_cpu: torch.Tensor,
+    ) -> None:
+        """Synchronously load strict signed group-32 packed expert weights."""
+
+        if not is_rawint4_sft_method(self.method):
+            raise ValueError(f"load_rawint4_weights() requires RAWINT4_SFT, got {self.method!r}")
+        if int(weights.group_size) != 32:
+            raise ValueError(f"RAWINT4 SFT requires group_size=32, got {weights.group_size}")
+
+        projections = {
+            "gate": (
+                weights.gate_proj,
+                weights.gate_scale,
+                (self.num_experts, self.moe_intermediate_size, self.hidden_size // 2),
+                (self.num_experts, self.moe_intermediate_size, self.hidden_size // 32),
+            ),
+            "up": (
+                weights.up_proj,
+                weights.up_scale,
+                (self.num_experts, self.moe_intermediate_size, self.hidden_size // 2),
+                (self.num_experts, self.moe_intermediate_size, self.hidden_size // 32),
+            ),
+            "down": (
+                weights.down_proj,
+                weights.down_scale,
+                (self.num_experts, self.hidden_size, self.moe_intermediate_size // 2),
+                (self.num_experts, self.hidden_size, self.moe_intermediate_size // 32),
+            ),
+        }
+        for name, (packed, scale, packed_shape, scale_shape) in projections.items():
+            if (
+                packed.device.type != "cpu"
+                or packed.dtype != torch.uint8
+                or not packed.is_contiguous()
+                or tuple(packed.shape) != packed_shape
+            ):
+                raise ValueError(f"{name} RAWINT4 weight must be contiguous CPU uint8 with " f"shape {packed_shape}")
+            if (
+                scale.device.type != "cpu"
+                or scale.dtype != torch.bfloat16
+                or not scale.is_contiguous()
+                or tuple(scale.shape) != scale_shape
+            ):
+                raise ValueError(f"{name} RAWINT4 scale must be contiguous CPU BF16 with " f"shape {scale_shape}")
+
+        self.gate_proj = weights.gate_proj
+        self.gate_scale = weights.gate_scale
+        self.up_proj = weights.up_proj
+        self.up_scale = weights.up_scale
+        self.down_proj = weights.down_proj
+        self.down_scale = weights.down_scale
+        self._use_rawint4_tensor_path = True
+        self.load_weights(physical_to_logical_map_cpu)
+
+    def load_block_fp8_weights(
+        self,
+        weights: BlockFP8ExpertWeights,
+        physical_to_logical_map_cpu: torch.Tensor,
+    ) -> None:
+        """Synchronously pack raw per-expert FP8 checkpoint tensors in C++."""
+
+        if not is_fp8_sft_method(self.method):
+            raise ValueError(f"load_block_fp8_weights() requires AMXFP8_SFT, got {self.method!r}")
+        if tuple(weights.block_size) != (128, 128):
+            raise ValueError("AMXFP8_SFT requires block_size=(128, 128), " f"got {weights.block_size}")
+
+        projections = {
+            "gate": (weights.gate_proj, weights.gate_scale, (self.moe_intermediate_size, self.hidden_size)),
+            "up": (weights.up_proj, weights.up_scale, (self.moe_intermediate_size, self.hidden_size)),
+            "down": (weights.down_proj, weights.down_scale, (self.hidden_size, self.moe_intermediate_size)),
+        }
+        for name, (expert_weights, expert_scales, expected_shape) in projections.items():
+            if len(expert_weights) != self.num_experts or len(expert_scales) != self.num_experts:
+                raise ValueError(
+                    f"{name} FP8 tensors must contain {self.num_experts} experts, got "
+                    f"weights={len(expert_weights)}, scales={len(expert_scales)}"
+                )
+            expected_scale_shape = (expected_shape[0] // 128, expected_shape[1] // 128)
+            for expert_idx, (weight, scale) in enumerate(zip(expert_weights, expert_scales)):
+                if (
+                    weight.device.type != "cpu"
+                    or weight.dtype != torch.float8_e4m3fn
+                    or not weight.is_contiguous()
+                    or tuple(weight.shape) != expected_shape
+                ):
+                    raise ValueError(
+                        f"{name} expert {expert_idx} must be contiguous CPU E4M3FN " f"with shape {expected_shape}"
+                    )
+                if (
+                    scale.device.type != "cpu"
+                    or scale.dtype != torch.float32
+                    or not scale.is_contiguous()
+                    or tuple(scale.shape) != expected_scale_shape
+                ):
+                    raise ValueError(
+                        f"{name} scale {expert_idx} must be contiguous CPU FP32 " f"with shape {expected_scale_shape}"
+                    )
+
+        self._gate_weights_per_numa = [weights.gate_proj]
+        self._up_weights_per_numa = [weights.up_proj]
+        self._down_weights_per_numa = [weights.down_proj]
+        self._gate_scales_per_numa = [weights.gate_scale]
+        self._up_scales_per_numa = [weights.up_scale]
+        self._down_scales_per_numa = [weights.down_scale]
+        self._gate_projs_ptrs = [[tensor.data_ptr() for tensor in weights.gate_proj]]
+        self._up_projs_ptrs = [[tensor.data_ptr() for tensor in weights.up_proj]]
+        self._down_projs_ptrs = [[tensor.data_ptr() for tensor in weights.down_proj]]
+        self._gate_scale_ptrs = [[tensor.data_ptr() for tensor in weights.gate_scale]]
+        self._up_scale_ptrs = [[tensor.data_ptr() for tensor in weights.up_scale]]
+        self._down_scale_ptrs = [[tensor.data_ptr() for tensor in weights.down_scale]]
+        self._has_bwd_projs = False
+        self._use_projs_path = True
+        self.gate_proj = None
+        self.up_proj = None
+        self.down_proj = None
+        self.load_weights(physical_to_logical_map_cpu)
+
+    def _stage_mxfp4_weights(self, experts_data: dict[str, List[torch.Tensor]]) -> None:
+        """Validate native MXFP4 tensors and retain them until C++ load completes."""
+
+        if not is_mxfp4_sft_method(self.method):
+            raise ValueError(f"MXFP4 weights require MXFP4_SFT, got {self.method!r}")
+        if not isinstance(experts_data, dict):
+            raise TypeError("MXFP4 expert weights must be the dict returned by " "MXFP4SafeTensorLoader.load_experts()")
+
+        expected = {
+            "gate": (torch.uint8, (self.moe_intermediate_size, self.hidden_size // 2)),
+            "up": (torch.uint8, (self.moe_intermediate_size, self.hidden_size // 2)),
+            "down": (torch.uint8, (self.hidden_size, self.moe_intermediate_size // 2)),
+            "gate_scale": (
+                torch.bfloat16,
+                (self.moe_intermediate_size, self.hidden_size // 32),
+            ),
+            "up_scale": (
+                torch.bfloat16,
+                (self.moe_intermediate_size, self.hidden_size // 32),
+            ),
+            "down_scale": (
+                torch.bfloat16,
+                (self.hidden_size, self.moe_intermediate_size // 32),
+            ),
+        }
+        validated: dict[str, List[torch.Tensor]] = {}
+        for name, (dtype, shape) in expected.items():
+            tensors = experts_data.get(name)
+            if not isinstance(tensors, (list, tuple)) or len(tensors) != self.num_experts:
+                actual = len(tensors) if isinstance(tensors, (list, tuple)) else type(tensors).__name__
+                raise ValueError(f"MXFP4 {name} must contain {self.num_experts} expert tensors, got {actual}")
+            checked = []
+            for expert_idx, tensor in enumerate(tensors):
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError(f"MXFP4 {name}[{expert_idx}] must be a torch.Tensor, got {type(tensor)!r}")
+                if (
+                    tensor.device.type != "cpu"
+                    or tensor.dtype != dtype
+                    or tuple(tensor.shape) != shape
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"MXFP4 {name}[{expert_idx}] must be contiguous CPU {dtype} "
+                        f"with shape {shape}, got {tensor.dtype} {tuple(tensor.shape)} "
+                        f"on {tensor.device}"
+                    )
+                if name.endswith("_scale") and not torch.isfinite(tensor).all().item():
+                    raise ValueError(f"MXFP4 {name}[{expert_idx}] contains a non-finite scale")
+                checked.append(tensor)
+            validated[name] = checked
+
+        self._gate_weights_per_numa = [validated["gate"]]
+        self._up_weights_per_numa = [validated["up"]]
+        self._down_weights_per_numa = [validated["down"]]
+        self._gate_scales_per_numa = [validated["gate_scale"]]
+        self._up_scales_per_numa = [validated["up_scale"]]
+        self._down_scales_per_numa = [validated["down_scale"]]
+        self._gate_projs_ptrs = [[tensor.data_ptr() for tensor in validated["gate"]]]
+        self._up_projs_ptrs = [[tensor.data_ptr() for tensor in validated["up"]]]
+        self._down_projs_ptrs = [[tensor.data_ptr() for tensor in validated["down"]]]
+        self._gate_scale_ptrs = [[tensor.data_ptr() for tensor in validated["gate_scale"]]]
+        self._up_scale_ptrs = [[tensor.data_ptr() for tensor in validated["up_scale"]]]
+        self._down_scale_ptrs = [[tensor.data_ptr() for tensor in validated["down_scale"]]]
+        self._has_bwd_projs = False
+        self._use_projs_path = True
+        self.gate_proj = None
+        self.up_proj = None
+        self.down_proj = None
+
+    def load_mxfp4_weights(
+        self,
+        experts_data: dict[str, List[torch.Tensor]],
+        physical_to_logical_map_cpu: torch.Tensor,
+    ) -> None:
+        """Load native E2M1/UE8M0 expert tensors without dequantizing the base."""
+
+        if self._weights_loaded:
+            raise RuntimeError("MXFP4_SFT weights are immutable and already loaded")
+        self._stage_mxfp4_weights(experts_data)
+        self.load_weights(physical_to_logical_map_cpu)
 
     def _load_base_weights_from_file(self) -> None:
         if not hasattr(self, "weight_path") or self.weight_path is None:
@@ -287,12 +727,41 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
                 "Either set weight_path or call load_weights_from_tensors() instead."
             )
 
+        if is_mxfp4_sft_method(self.method):
+            loader = MXFP4SafeTensorLoader(self.weight_path)
+            try:
+                experts_data = loader.load_experts(
+                    f"model.layers.{self.layer_idx}",
+                    device="cpu",
+                    reject_non_finite_scales=True,
+                )
+                self._stage_mxfp4_weights(experts_data)
+            finally:
+                loader.close_all_handles()
+            return
+
         kt_layer_dir = os.path.join(self.weight_path, f"_layer_{self.layer_idx}")
         if os.path.isdir(kt_layer_dir):
             kt_files = _glob.glob(os.path.join(kt_layer_dir, "_numa_0", "*.kt"))
             if kt_files:
                 self._use_kt_direct_load = True
                 return
+        if is_fp8_sft_method(self.method):
+            raise RuntimeError(
+                "AMXFP8_SFT requires raw per-expert HF checkpoint tensors; "
+                "legacy merged weight files are not supported"
+            )
+        if is_rawint4_sft_method(self.method):
+            raise RuntimeError(
+                "RAWINT4 SFT requires packed compressed-tensors checkpoint tensors; "
+                "legacy merged weight files are not supported"
+            )
+        if is_int8_sft_method(self.method):
+            raise RuntimeError(
+                f"INT8_SFT requires pre-quantized .kt files under "
+                f"{kt_layer_dir}/_numa_*/; merged safetensors and online "
+                "conversion are not supported"
+            )
 
         if "BF16" in self.method:
             loader = BF16SafeTensorLoader(self.weight_path)
@@ -312,6 +781,7 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
             self.up_proj = torch.stack(up_weights, dim=0).contiguous()
             self.down_proj = torch.stack(down_weights, dim=0).contiguous()
         else:
+
             def _make_ptrs(arrays_per_numa):
                 return [
                     [
@@ -392,9 +862,7 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
                 raise ValueError(f"{name} has {len(per_numa)} NUMA partitions, expected {numa_count}.")
             for numa_id, entries in enumerate(per_numa):
                 if len(entries) != self.num_experts:
-                    raise ValueError(
-                        f"{name}[numa={numa_id}] has {len(entries)} experts, expected {self.num_experts}."
-                    )
+                    raise ValueError(f"{name}[numa={numa_id}] has {len(entries)} experts, expected {self.num_experts}.")
 
         for numa_id in range(numa_count):
             gate_scale_len = self._gate_scales_per_numa[numa_id][0].size
@@ -416,12 +884,18 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
 
     def init_lora_weights(
         self,
-        gate_lora_a: torch.Tensor, gate_lora_b: torch.Tensor,
-        up_lora_a: torch.Tensor, up_lora_b: torch.Tensor,
-        down_lora_a: torch.Tensor, down_lora_b: torch.Tensor,
-        grad_gate_lora_a: torch.Tensor, grad_gate_lora_b: torch.Tensor,
-        grad_up_lora_a: torch.Tensor, grad_up_lora_b: torch.Tensor,
-        grad_down_lora_a: torch.Tensor, grad_down_lora_b: torch.Tensor,
+        gate_lora_a: torch.Tensor,
+        gate_lora_b: torch.Tensor,
+        up_lora_a: torch.Tensor,
+        up_lora_b: torch.Tensor,
+        down_lora_a: torch.Tensor,
+        down_lora_b: torch.Tensor,
+        grad_gate_lora_a: torch.Tensor,
+        grad_gate_lora_b: torch.Tensor,
+        grad_up_lora_a: torch.Tensor,
+        grad_up_lora_b: torch.Tensor,
+        grad_down_lora_a: torch.Tensor,
+        grad_down_lora_b: torch.Tensor,
     ) -> None:
         expected_shapes = {
             "gate_lora_a": (self.num_experts, self.lora_rank, self.hidden_size),
@@ -432,32 +906,67 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
             "down_lora_b": (self.num_experts, self.hidden_size, self.lora_rank),
         }
         provided = {
-            "gate_lora_a": gate_lora_a, "gate_lora_b": gate_lora_b,
-            "up_lora_a": up_lora_a, "up_lora_b": up_lora_b,
-            "down_lora_a": down_lora_a, "down_lora_b": down_lora_b,
+            "gate_lora_a": gate_lora_a,
+            "gate_lora_b": gate_lora_b,
+            "up_lora_a": up_lora_a,
+            "up_lora_b": up_lora_b,
+            "down_lora_a": down_lora_a,
+            "down_lora_b": down_lora_b,
         }
         for name, tensor in provided.items():
             expected = expected_shapes[name]
             if tensor.shape != expected:
                 raise ValueError(f"{name} shape mismatch: expected {expected}, got {tuple(tensor.shape)}")
             if tensor.device.type != "cpu":
+                raise ValueError(f"{name} must be a CPU tensor for {self.method} SFT, got {tensor.device}.")
+            if tensor.dtype != torch.bfloat16:
+                raise ValueError(f"{name} must use torch.bfloat16 for {self.method} SFT, got {tensor.dtype}.")
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous for stable {self.method} pointer registration.")
+
+        grad_provided = {
+            "grad_gate_lora_a": grad_gate_lora_a,
+            "grad_gate_lora_b": grad_gate_lora_b,
+            "grad_up_lora_a": grad_up_lora_a,
+            "grad_up_lora_b": grad_up_lora_b,
+            "grad_down_lora_a": grad_down_lora_a,
+            "grad_down_lora_b": grad_down_lora_b,
+        }
+        for name, tensor in grad_provided.items():
+            expected = expected_shapes[name.removeprefix("grad_")]
+            if tensor.shape != expected:
+                raise ValueError(f"{name} shape mismatch: expected {expected}, got {tuple(tensor.shape)}")
+            if tensor.device.type != "cpu" or tensor.dtype != torch.bfloat16:
                 raise ValueError(
-                    f"{name} must be a CPU tensor for {self.method} SFT, got {tensor.device}."
+                    f"{name} must be a CPU torch.bfloat16 tensor for {self.method} SFT, "
+                    f"got {tensor.dtype} on {tensor.device}."
                 )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous for stable {self.method} pointer registration.")
 
-        self.gate_lora_a = gate_lora_a.contiguous()
-        self.gate_lora_b = gate_lora_b.contiguous()
-        self.up_lora_a = up_lora_a.contiguous()
-        self.up_lora_b = up_lora_b.contiguous()
-        self.down_lora_a = down_lora_a.contiguous()
-        self.down_lora_b = down_lora_b.contiguous()
+        self.gate_lora_a = gate_lora_a
+        self.gate_lora_b = gate_lora_b
+        self.up_lora_a = up_lora_a
+        self.up_lora_b = up_lora_b
+        self.down_lora_a = down_lora_a
+        self.down_lora_b = down_lora_b
 
-        self.grad_gate_lora_a = grad_gate_lora_a.contiguous()
-        self.grad_gate_lora_b = grad_gate_lora_b.contiguous()
-        self.grad_up_lora_a = grad_up_lora_a.contiguous()
-        self.grad_up_lora_b = grad_up_lora_b.contiguous()
-        self.grad_down_lora_a = grad_down_lora_a.contiguous()
-        self.grad_down_lora_b = grad_down_lora_b.contiguous()
+        self.grad_gate_lora_a = grad_gate_lora_a
+        self.grad_gate_lora_b = grad_gate_lora_b
+        self.grad_up_lora_a = grad_up_lora_a
+        self.grad_up_lora_b = grad_up_lora_b
+        self.grad_down_lora_a = grad_down_lora_a
+        self.grad_down_lora_b = grad_down_lora_b
+
+        if getattr(self, "_uses_authoritative_optimizer_grads", False):
+            parameter_count = sum(isinstance(tensor, torch.nn.Parameter) for tensor in provided.values())
+            if parameter_count not in (0, len(provided)):
+                raise ValueError(
+                    "authoritative LoRA ownership requires all six weights to be nn.Parameter objects or none"
+                )
+            if parameter_count:
+                for name, parameter in provided.items():
+                    self.register_authoritative_optimizer_grad(f"lora.{name}", parameter, grad_provided[f"grad_{name}"])
 
         self._lora_initialized = True
 
@@ -470,6 +979,8 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
         if self._is_skip_lora:
             return
         if not self._lora_initialized:
+            if self.lora_rank <= 0:
+                return  # Full mode without LoRA — no LoRA weights to update
             raise RuntimeError("LoRA weights not initialized. Call init_lora_weights() first.")
 
         # Weight pointer updates are load-time synchronous work. Calling the
@@ -482,6 +993,52 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
             self.up_lora_b.data_ptr(),
             self.down_lora_a.data_ptr(),
             self.down_lora_b.data_ptr(),
+        )
+
+    def update_base_weights(self) -> None:
+        """Sync updated base weight parameters back to C++ kernel after optimizer step."""
+        if not self._weights_loaded:
+            raise RuntimeError("Weights not loaded. Call load_weights() first.")
+        if not self._full_weight_grad:
+            return  # No base weights to update in LoRA mode
+        if self.gate_proj_buf is None:
+            raise RuntimeError("Base weight buffers not initialized. Call init_full_weight_grad_buffers() first.")
+
+        logger.info(f"Layer {self.layer_idx}: update_base_weights() - syncing updated weights to C++ kernel")
+
+        # Preferred path: update config pointers on existing C++ object and re-quantize.
+        # This avoids full C++ MOE object recreation (~0.6s/layer vs ~1.9s/layer).
+        if hasattr(self.moe, "set_base_weight_pointers"):
+            self.moe.set_base_weight_pointers(
+                self.gate_proj_buf.data.data_ptr(),
+                self.up_proj_buf.data.data_ptr(),
+                self.down_proj_buf.data.data_ptr(),
+            )
+            self.cpu_infer.submit(self.moe.load_weights_task())
+            self.cpu_infer.sync()
+            logger.info(f"Layer {self.layer_idx}: update_base_weights() - re-quantized existing kernel")
+            return
+
+        # Fallback: full reload path (creates new C++ MOE object)
+        # This is slower but works without C++ set_base_weight_pointers support.
+        logger.warning(
+            f"Layer {self.layer_idx}: set_base_weight_pointers not available, "
+            f"falling back to full C++ MOE object recreation"
+        )
+        old_moe = getattr(self, "moe", None)
+        if old_moe is not None:
+            del old_moe
+
+        self.gate_proj = self.gate_proj_buf.data
+        self.up_proj = self.up_proj_buf.data
+        self.down_proj = self.down_proj_buf.data
+        physical_to_logical_map = torch.arange(self.num_experts, dtype=torch.int64, device="cpu")
+        self._weights_loaded = False  # Allow re-load
+        self.load_weights_from_tensors(
+            gate_proj=self.gate_proj,
+            up_proj=self.up_proj,
+            down_proj=self.down_proj,
+            physical_to_logical_map_cpu=physical_to_logical_map,
         )
 
     def save_backward_weights_from_tensors(

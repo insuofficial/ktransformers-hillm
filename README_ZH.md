@@ -17,6 +17,11 @@ KTransformers 是一个专注于通过 CPU-GPU 异构计算实现大语言模型
 
 ## 🔥 更新
 
+* **2026 年 10 月 8 日**：公开 **KTransformers-FineTune（KT-FT）** 作者预印本，介绍通过布局优化与动态调度实现高效 MoE 异构协同微调的方法。[论文与引用](./papers/kt-ft/README_ZH.md) · [PDF](./papers/kt-ft/ktransformers-finetune.pdf)。
+* **2026 年 8 月 25 日**：上传了全新的易用版 [KTransformers × LlamaFactory MoE 微调 Cookbook](./doc/zh/KTransformers-Fine-Tuning_Cookbook_zh.md)，覆盖硬件检查、环境安装、BF16/FP8/INT8 配置、LoRA 与全量微调、资源规划及故障排查。
+* **2026 年 8 月 17 日**：LoRA 微调支持兼容 AVX512 的 x86 CPU，包括 AMD 服务器，无需依赖 AMX。（[v0.7.0 Release Notes](https://github.com/kvcache-ai/ktransformers/releases/tag/v0.7.0)）
+* **2026 年 8 月 5 日**：新增原生 block-FP8 LoRA 微调，可直接加载 checkpoint 中的 FP8 Routed Expert 权重，无需生成完整的 BF16 权重副本。（[PR #2141](https://github.com/kvcache-ai/ktransformers/pull/2141)）
+* **2026 年 7 月 23 日**：新增面向 MoE 模型的端到端 BF16 全量微调，并支持保存完整 checkpoint。（[PR #2094](https://github.com/kvcache-ai/ktransformers/pull/2094)）
 * **2026 年 4 月 30 日**：KTransformers v0.6.1 更新 kt-kernel 推理和 SFT 文档，提供独立的[推理](./kt-kernel/README.md)和 [SFT Quick Start](./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.md)入口。
 * **2025 年 12 月 5 日**：支持原生 Kimi-K2-Thinking 推理（[教程](./doc/en/kt-kernel/Kimi-K2-Thinking-Native.md)）
 * **2025 年 11 月 6 日**：支持 Kimi-K2-Thinking 推理（[教程](./doc/en/Kimi-K2-Thinking.md)）和微调（[教程](./doc/en/SFT_Installation_Guide_KimiK2.md)）
@@ -38,7 +43,7 @@ KTransformers 是一个专注于通过 CPU-GPU 异构计算实现大语言模型
 * **2025 年 2 月 15 日**：更长上下文（24GB VRAM 从 4K 到 8K）& 速度稍快（+15%，最高 16 Tokens/s），更新[文档](./doc/en/DeepseekR1_V3_tutorial.md)和[在线手册](https://kvcache-ai.github.io/ktransformers/)
 * **2025 年 2 月 10 日**：支持 Deepseek-R1 和 V3 在单 GPU（24GB VRAM）/多 GPU 和 382GB DRAM 上运行，速度提升高达 3~28 倍。详细案例展示和复现教程请参见[这里](./doc/en/DeepseekR1_V3_tutorial.md)
 * **2024 年 8 月 28 日**：将 DeepseekV2 所需的 VRAM 从 21GB 降低到 11GB
-* **2024 年 8 月 15 日**：更新了关于注入和多 GPU 的详细[教程](doc/en/injection_tutorial.md)
+* **2024 年 8 月 15 日**：更新了关于注入和多 GPU 的详细[教程](doc/en/SFT/injection_tutorial.md)
 * **2024 年 8 月 14 日**：支持 llamfile 作为线性后端
 * **2024 年 8 月 12 日**：支持多 GPU；支持新模型：mixtral 8\*7B 和 8\*22B；支持 GPU 上的 q2k、q3k、q5k 去量化
 * **2024 年 8 月 9 日**：支持 Windows 原生环境
@@ -80,18 +85,22 @@ pip install .
 
 ---
 
-### 🎓 [SFT](./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.md) - LLaMA-Factory 微调
+### 🎓 [SFT](./doc/zh/KTransformers-Fine-Tuning_Cookbook_zh.md) - LlamaFactory 微调
 
-KTransformers × LLaMA-Factory 集成，面向超大 MoE 模型微调。
+**研究论文：** [KTransformers-FineTune（KT-FT）](./papers/kt-ft/README_ZH.md) · [PDF](./papers/kt-ft/ktransformers-finetune.pdf)。
 
-![KTransformers SFT](./doc/assets/image-20251011010558909.png)
+KTransformers × LlamaFactory 集成，面向超大 MoE 模型微调。新的 Cookbook 提供从硬件检查、环境安装到 BF16/FP8/INT8 配置、LoRA/全量训练、资源规划和故障排查的易用流程。
+
+**支持 Kimi K2.5 / K2.6 LoRA 微调**，保留 routed experts 的原生 RAWINT4 权重。参见 [PyPI 安装、训练、续训与 SGLang 推理教程](./.github/release/examples/kimi-k25/README.md)。端到端实机验证使用 Kimi K2.5；K2.6 沿用相同模型架构路径。
+
+![LlamaFactory 与 KTransformers MoE 微调架构](./doc/assets/llamafactory-kt-integration-overview.png)
 
 **主要特性:**
 - **多后端支持**: CPU/GPU 混合微调，支持 INT8/INT4 量化
 - **超大 MoE 支持**: 在有限 GPU 内存下微调 DeepSeek-V3/R1 等模型
 - **相对 ZeRO-Offload 加速**: 在基准 MoE SFT 任务中训练速度提升 6-12 倍
 - **降低 CPU 内存**: 相比上一版 KT SFT 路径，基准配置下 CPU 内存约降至 1/2
-- **LLaMA-Factory 集成**: 与流行微调框架无缝集成
+- **LlamaFactory 集成**: 与流行微调框架无缝集成
 
 | 模型 | GPU 内存 | 训练速度 | 硬件 |
 |-------|------------|----------------|----------|
@@ -102,14 +111,16 @@ KTransformers × LLaMA-Factory 集成，面向超大 MoE 模型微调。
 **快速开始:**
 ```bash
 cd /path/to/LLaMA-Factory
-pip install -e .
-pip install -r requirements/ktransformers.txt
+python -m pip install -e .
+python -m pip install "ktransformers[sft]==0.7.0"
+python -m pip install "sglang-kt==0.7.0"
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
   --config_file examples/ktransformers/accelerate/fsdp2_kt_int8.yaml \
   src/train.py \
   examples/ktransformers/train_lora/qwen3_5moe_lora_sft_kt.yaml
 ```
 
+👉 **[易用版微调 Cookbook →](./doc/zh/KTransformers-Fine-Tuning_Cookbook_zh.md)**
 👉 **[Quick Start →](./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.md)**
 👉 **[完整文档 →](./doc/en/SFT/KTransformers-Fine-Tuning_User-Guide.md)**
 
@@ -117,7 +128,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
 
 ## 🔥 引用
 
-如果您在研究中使用了 KTransformers，请引用我们的论文：
+如果您在研究中使用了 KTransformers，请引用相应的论文。
+
+### 推理论文
 
 ```bibtex
 @inproceedings{10.1145/3731569.3764843,
@@ -125,6 +138,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
   author = {Chen, Hongtao and Xie, Weiyu and Zhang, Boxin and Tang, Jingqi and Wang, Jiahao and Dong, Jianwei and Chen, Shaoyuan and Yuan, Ziwei and Lin, Chen and Qiu, Chengyu and Zhu, Yuening and Ou, Qingliang and Liao, Jiaqi and Chen, Xianglin and Ai, Zhiyuan and Wu, Yongwei and Zhang, Mingxing},
   booktitle = {Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles},
   year = {2025}
+}
+```
+
+### 微调论文
+
+[KTransformers-FineTune（KT-FT）](./papers/kt-ft/README_ZH.md) · [完整 BibTeX](./papers/kt-ft/CITATION.bib)
+
+```bibtex
+@misc{li2026ktft,
+  title = {{KTransformers-FineTune: Beyond Offload with Layout-Aware and Schedule-Optimized Heterogeneous MoE Fine-Tuning}},
+  author = {Li, Peilin and Hao, Xingxing and Chen, Hongtao and Xie, Weiyu and Zheng, Yaowei and Wu, Bowen and Yang, Yujie and Shen, Huanming and Ou, Qingliang and Zhang, Boxin and Tang, Jingqi and Yuan, Ziwei and Dong, Jianwei and Kuang, Dongdong and Feng, Zhangchi and Dai, Jiaheng and Yang, Qianrui and Chen, Shaoyuan and Wang, Jiahao and Han, Yaochen and Zhu, Yuening and Liao, Jiaqi and Chen, Xianglin and Ai, Zhiyuan and Wu, Yongwei and Zhang, Mingxing},
+  year = {2026},
+  note = {Author preprint, version paper-ktft-v1.1},
+  howpublished = {Author preprint, GitHub},
+  url = {https://github.com/kvcache-ai/ktransformers/tree/paper-ktft-v1.1/papers/kt-ft}
 }
 ```
 

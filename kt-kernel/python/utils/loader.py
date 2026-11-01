@@ -48,6 +48,42 @@ class GGMLQuantizationType(IntEnum):
     F64 = 28
     IQ1_M = 29
     BF16 = 30
+    MXFP4 = 39  # OCP microscaling FP4 (E2M1 + ue8m0), id aligned with upstream ggml
+
+
+# (block_size, type_size) per GGML quant type — bytes per `block_size` elements.
+GGML_QUANT_SIZES = {
+    GGMLQuantizationType.F32: (1, 4),
+    GGMLQuantizationType.F16: (1, 2),
+    GGMLQuantizationType.BF16: (1, 2),
+    GGMLQuantizationType.Q4_0: (32, 2 + 16),
+    GGMLQuantizationType.Q4_1: (32, 2 + 2 + 16),
+    GGMLQuantizationType.Q5_0: (32, 2 + 4 + 16),
+    GGMLQuantizationType.Q5_1: (32, 2 + 2 + 4 + 16),
+    GGMLQuantizationType.Q8_0: (32, 2 + 32),
+    GGMLQuantizationType.Q8_1: (32, 4 + 4 + 32),
+    GGMLQuantizationType.Q2_K: (256, 2 + 2 + 256 // 16 + 256 // 4),
+    GGMLQuantizationType.Q3_K: (256, 2 + 256 // 4 + 256 // 8 + 12),
+    GGMLQuantizationType.Q4_K: (256, 2 + 2 + 256 // 2 + 12),
+    GGMLQuantizationType.Q5_K: (256, 2 + 2 + 256 // 2 + 256 // 8 + 12),
+    GGMLQuantizationType.Q6_K: (256, 2 + 256 // 2 + 256 // 4 + 256 // 16),
+    GGMLQuantizationType.Q8_K: (256, 4 + 256 + 256 // 8),
+    GGMLQuantizationType.IQ2_XXS: (256, 2 + 256 // 4),
+    GGMLQuantizationType.IQ2_XS: (256, 2 + 256 // 4 + 256 // 32),
+    GGMLQuantizationType.IQ3_XXS: (256, 2 + 256 // 4 + 256 // 8),
+    GGMLQuantizationType.IQ1_S: (256, 2 + 256 // 8 + 256 // 16),
+    GGMLQuantizationType.IQ4_NL: (32, 2 + 16),
+    GGMLQuantizationType.IQ3_S: (256, 2 + 256 // 4 + 256 // 8 + 256 // 32 + 4),
+    GGMLQuantizationType.IQ2_S: (256, 2 + 256 // 4 + 256 // 16),
+    GGMLQuantizationType.IQ4_XS: (256, 2 + 2 + 256 // 2 + 256 // 64),
+    GGMLQuantizationType.I8: (1, 1),
+    GGMLQuantizationType.I16: (1, 2),
+    GGMLQuantizationType.I32: (1, 4),
+    GGMLQuantizationType.I64: (1, 8),
+    GGMLQuantizationType.F64: (1, 8),
+    GGMLQuantizationType.IQ1_M: (256, 256 // 8 + 256 // 16 + 256 // 32),
+    GGMLQuantizationType.MXFP4: (32, 1 + 16),  # 1B e8m0 scale + 16B nibble-packed E2M1
+}
 
 
 def translate_name_to_gguf(name):
@@ -679,6 +715,49 @@ class BF16SafeTensorLoader(SafeTensorLoader):
 class CompressedSafeTensorLoader(SafeTensorLoader):
     """Loader for compressed SafeTensor layouts (RAWINT4 weights)."""
 
+    @staticmethod
+    def _normalize_rawint4_weight(weight_tensor, scale_tensor, shape_tensor=None, key: str = "weight_packed"):
+        """Return byte-packed uint8 RAWINT4 weights expected by kt_kernel_ext."""
+        if weight_tensor.dtype == torch.int32:
+            # compressed-tensors pack-quantized stores 8 int4 values per int32.
+            # The RAWINT4 kernels consume the same bytes as uint8, two int4 values per byte.
+            rows, int32_cols = weight_tensor.shape
+            weight_tensor = weight_tensor.contiguous().view(torch.uint8).view(rows, int32_cols * 4).contiguous()
+        elif weight_tensor.dtype == torch.uint8:
+            weight_tensor = weight_tensor.contiguous()
+        else:
+            raise TypeError(f"{key} must be torch.uint8 or torch.int32, got {weight_tensor.dtype}")
+
+        if shape_tensor is None:
+            return weight_tensor
+
+        shape_values = shape_tensor.detach().cpu().tolist()
+        if len(shape_values) != 2:
+            raise ValueError(f"{key}.weight_shape must contain [out_features, in_features], got {shape_values}")
+
+        out_features, in_features = (int(shape_values[0]), int(shape_values[1]))
+        if out_features <= 0 or in_features <= 0:
+            return weight_tensor
+
+        if in_features % 2 != 0:
+            return weight_tensor
+
+        expected_weight_shape = (out_features, in_features // 2)
+        if tuple(weight_tensor.shape) != expected_weight_shape:
+            return weight_tensor
+
+        if scale_tensor.dim() != 2 or scale_tensor.shape[0] != out_features or scale_tensor.shape[1] <= 0:
+            raise ValueError(
+                f"{key} scale shape {tuple(scale_tensor.shape)} is incompatible with weight_shape={shape_values}"
+            )
+
+        if in_features % int(scale_tensor.shape[1]) != 0:
+            raise ValueError(
+                f"{key} in_features={in_features} is not divisible by scale columns={scale_tensor.shape[1]}"
+            )
+
+        return weight_tensor
+
     def load_experts(self, base_key: str, device: str = "cpu"):
         """Load raw expert weights stored in compressed safetensor format."""
 
@@ -703,6 +782,7 @@ class CompressedSafeTensorLoader(SafeTensorLoader):
             for exp_id in range(expert_idx):
                 weight_key = f"{experts_prefix}.{exp_id}.{proj_name}_proj.weight_packed"
                 scale_key = f"{experts_prefix}.{exp_id}.{proj_name}_proj.weight_scale"
+                shape_key = f"{experts_prefix}.{exp_id}.{proj_name}_proj.weight_shape"
 
                 if not self.has_tensor(weight_key):
                     raise KeyError(f"Missing tensor: {weight_key}")
@@ -711,6 +791,8 @@ class CompressedSafeTensorLoader(SafeTensorLoader):
 
                 weight_tensor = self.load_tensor(weight_key, device).contiguous()
                 scale_tensor = self.load_tensor(scale_key, device).contiguous()
+                shape_tensor = self.load_tensor(shape_key, "cpu") if self.has_tensor(shape_key) else None
+                weight_tensor = self._normalize_rawint4_weight(weight_tensor, scale_tensor, shape_tensor, weight_key)
 
                 weight_entries.append(weight_tensor)
                 scale_entries.append(scale_tensor)
@@ -978,43 +1060,20 @@ class GGUFLoader:
         n_elements = info["n_elements"]
         ggml_type = info["dtype"]
 
-        GGML_QUANT_SIZES = {
-            GGMLQuantizationType.F32: (1, 4),
-            GGMLQuantizationType.F16: (1, 2),
-            GGMLQuantizationType.BF16: (1, 2),
-            GGMLQuantizationType.Q4_0: (32, 2 + 16),
-            GGMLQuantizationType.Q4_1: (32, 2 + 2 + 16),
-            GGMLQuantizationType.Q5_0: (32, 2 + 4 + 16),
-            GGMLQuantizationType.Q5_1: (32, 2 + 2 + 4 + 16),
-            GGMLQuantizationType.Q8_0: (32, 2 + 32),
-            GGMLQuantizationType.Q8_1: (32, 4 + 4 + 32),
-            GGMLQuantizationType.Q2_K: (256, 2 + 2 + 256 // 16 + 256 // 4),
-            GGMLQuantizationType.Q3_K: (256, 2 + 256 // 4 + 256 // 8 + 12),
-            GGMLQuantizationType.Q4_K: (256, 2 + 2 + 256 // 2 + 12),
-            GGMLQuantizationType.Q5_K: (256, 2 + 2 + 256 // 2 + 256 // 8 + 12),
-            GGMLQuantizationType.Q6_K: (256, 2 + 256 // 2 + 256 // 4 + 256 // 16),
-            GGMLQuantizationType.Q8_K: (256, 4 + 256 + 256 // 8),
-            GGMLQuantizationType.IQ2_XXS: (256, 2 + 256 // 4),
-            GGMLQuantizationType.IQ2_XS: (256, 2 + 256 // 4 + 256 // 32),
-            GGMLQuantizationType.IQ3_XXS: (256, 2 + 256 // 4 + 256 // 8),
-            GGMLQuantizationType.IQ1_S: (256, 2 + 256 // 8 + 256 // 16),
-            GGMLQuantizationType.IQ4_NL: (32, 2 + 16),
-            GGMLQuantizationType.IQ3_S: (256, 2 + 256 // 4 + 256 // 8 + 256 // 32 + 4),
-            GGMLQuantizationType.IQ2_S: (256, 2 + 256 // 4 + 256 // 16),
-            GGMLQuantizationType.IQ4_XS: (256, 2 + 2 + 256 // 2 + 256 // 64),
-            GGMLQuantizationType.I8: (1, 1),
-            GGMLQuantizationType.I16: (1, 2),
-            GGMLQuantizationType.I32: (1, 4),
-            GGMLQuantizationType.I64: (1, 8),
-            GGMLQuantizationType.F64: (1, 8),
-            GGMLQuantizationType.IQ1_M: (256, 256 // 8 + 256 // 16 + 256 // 32),
-        }
-
         block_size, type_size = GGML_QUANT_SIZES[ggml_type]
         n_bytes = n_elements * type_size // block_size
 
         data_bytes = mmap_data[offset : offset + n_bytes]
-        data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8).copy())
+        # Zero-copy: the returned tensor is only ever consumed as a *read-only source* by the
+        # C++ MoE load_weights reshuffle (llamafile/moe.hpp memcpy SOURCE), which makes the
+        # single necessary copy into its NUMA-local buffers. So view the mmap directly instead
+        # of copying every layer's ~6.85GB single-threaded into anonymous RAM. The mmap stays
+        # alive in GGUFLoader.file_data_map; the wrapper pins the tensors in
+        # self.weights_to_keep until cpu_infer.sync() returns.
+        # (np.frombuffer over the memmap slice = read-only view, no copy; torch.from_numpy
+        # shares that buffer so data.data_ptr() points into the mmap. Use from_numpy, NOT
+        # torch.frombuffer — the latter is redirected to NPU by torch_npu's transfer_to_npu.)
+        data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8))
 
         return data, ggml_type
 
@@ -1161,17 +1220,41 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         return list(dict.fromkeys(candidates))
 
     @staticmethod
-    def _ue8m0_to_bf16(scale_t: torch.Tensor) -> torch.Tensor:
+    def _ue8m0_to_bf16(
+        scale_t: torch.Tensor, *, reject_non_finite: bool = False
+    ) -> torch.Tensor:
+        if reject_non_finite:
+            valid_dtypes = {torch.uint8}
+            native_ue8m0 = getattr(torch, "float8_e8m0fnu", None)
+            if native_ue8m0 is not None:
+                valid_dtypes.add(native_ue8m0)
+            if scale_t.dtype not in valid_dtypes:
+                raise TypeError(
+                    "MXFP4 SFT requires raw uint8/float8_e8m0fnu scales, "
+                    f"got {scale_t.dtype}"
+                )
         if scale_t.dtype != torch.uint8:
             scale_t = scale_t.view(torch.uint8)
-        # bf16 = [sign(1) | exp(8) | mant(7)]; setting mant=0, exp=e gives 2^(e-127),
-        # which is exactly the value encoded by ue8m0 for e ∈ [1, 254]. e=0 → bf16 +0
-        # (acceptable: ue8m0=0 represents 2^-127, below bf16 normal range), e=255 → +inf.
-        # Compute in int32 then narrow to int16 (max value is 255<<7=32640, fits int16),
-        # because torch CPU has no lshift kernel for uint16.
-        return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
+        if reject_non_finite and torch.any(scale_t == 0xFF).item():
+            raise ValueError(
+                "MXFP4 SFT rejects reserved UE8M0 scale 0xff because it "
+                "would decode to a non-finite BF16 value"
+            )
+        # BF16 normal exponent bits reproduce UE8M0 codes 1..254 exactly.
+        # UE8M0 code 0 is 2^-127, represented by BF16 subnormal bits 0x0040.
+        # Build through int32 because torch CPU has no lshift kernel for uint16.
+        scale_i32 = scale_t.to(torch.int32)
+        bf16_bits = scale_i32 << 7
+        bf16_bits = torch.where(scale_i32 == 0, 0x0040, bf16_bits)
+        return bf16_bits.to(torch.int16).view(torch.bfloat16).contiguous()
 
-    def load_experts(self, base_key: str, device: str = "cpu"):
+    def load_experts(
+        self,
+        base_key: str,
+        device: str = "cpu",
+        *,
+        reject_non_finite_scales: bool = False,
+    ):
         gate_name, up_name, down_name = self.PROJ_NAMES
         prefix = None
         expert_count = 0
@@ -1211,9 +1294,104 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (down_name, down_scales),
             ):
                 s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
-                dst[exp_id] = self._ue8m0_to_bf16(s)
+                dst[exp_id] = self._ue8m0_to_bf16(
+                    s, reject_non_finite=reject_non_finite_scales
+                )
 
         print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        return {
+            "gate": gate_weights,
+            "up": up_weights,
+            "down": down_weights,
+            "gate_scale": gate_scales,
+            "up_scale": up_scales,
+            "down_scale": down_scales,
+        }
+
+
+class NVFP4SafeTensorLoader(SafeTensorLoader):
+    """Loader for ModelOpt NVFP4 expert weights (W4A16_NVFP4, group_size 16).
+
+    Per expert layout (compressed-tensors / ModelOpt naming):
+      {base}.mlp.experts.{i}.gate_proj.weight          U8        [N, K/2]   nibble-packed E2M1
+      {base}.mlp.experts.{i}.gate_proj.weight_scale    F8_E4M3   [N, K/16]  per-block scale
+      {base}.mlp.experts.{i}.gate_proj.weight_scale_2  F32       scalar     per-tensor global
+      {base}.mlp.experts.{i}.{up_proj,down_proj}.{weight,weight_scale,weight_scale_2}
+
+    NVFP4 shares MXFP4's E2M1 codepoints and low-nibble-first packing, so the
+    weight bytes go to the FP4 kernel untouched; only the scale encoding differs.
+    The kernel consumes one FP32-valued scale per k-group, so both levels are
+    folded here into a single bf16 tensor:
+
+        scale[n, g] = float(e4m3(weight_scale[n, g])) * weight_scale_2
+
+    bf16 is lossy for E4M3 products (8 mantissa bits down to 7), which is what
+    the kernel's own group-32 MXFP4 path already accepts; measured against a
+    float64 dequant of the same bytes the end-to-end error is bf16-rounding
+    only (cosine 0.999993 on Ornith-1.5-35B-A3B-NVFP4).
+    """
+
+    EXPERTS_PATH_TPL = "{base}.mlp.experts"
+    PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")
+
+    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
+        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
+        for strip in ("model.language_model.", "language_model.model.", "language_model.", "model."):
+            if base_key.startswith(strip):
+                candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len(strip):]))
+        # ModelOpt checkpoints for multimodal Qwen3.5-MoE nest under
+        # model.language_model.layers.{L}; callers may pass either form.
+        if not base_key.startswith("model.language_model."):
+            for pre in ("model.language_model.", "language_model.model."):
+                if base_key.startswith("model."):
+                    candidates.append(self.EXPERTS_PATH_TPL.format(base=pre + base_key[len("model."):]))
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _fold_scales_to_bf16(block_scale: torch.Tensor, global_scale: torch.Tensor) -> torch.Tensor:
+        """e4m3 block scale x per-tensor f32 global -> bf16 [N, K/16]."""
+        s = block_scale.to(torch.float32) * global_scale.to(torch.float32).reshape(())
+        return s.to(torch.bfloat16).contiguous()
+
+    def load_experts(self, base_key: str, device: str = "cpu"):
+        gate_name, up_name, down_name = self.PROJ_NAMES
+        prefix = None
+        expert_count = 0
+        for cand in self._experts_prefix_candidates(base_key):
+            expert_count = 0
+            while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.weight"):
+                expert_count += 1
+            if expert_count > 0:
+                prefix = cand
+                break
+        if prefix is None:
+            raise ValueError(
+                f"No NVFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
+            )
+
+        gate_weights = [None] * expert_count
+        up_weights = [None] * expert_count
+        down_weights = [None] * expert_count
+        gate_scales = [None] * expert_count
+        up_scales = [None] * expert_count
+        down_scales = [None] * expert_count
+
+        for exp_id in range(expert_count):
+            for proj, wdst, sdst in (
+                (gate_name, gate_weights, gate_scales),
+                (up_name, up_weights, up_scales),
+                (down_name, down_weights, down_scales),
+            ):
+                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
+                if w.dtype != torch.uint8:
+                    w = w.view(torch.uint8)
+                wdst[exp_id] = w
+
+                bs = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale", device)
+                gs = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale_2", device)
+                sdst[exp_id] = self._fold_scales_to_bf16(bs, gs)
+
+        print(f"[NVFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
         return {
             "gate": gate_weights,
             "up": up_weights,

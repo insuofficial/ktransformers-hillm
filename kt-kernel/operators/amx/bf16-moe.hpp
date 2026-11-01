@@ -30,6 +30,8 @@
 template <class T = amx::GemmKernel224BF16>
 class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   using Base = AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>>;
+
+ protected:
   using Base::config_;
   using Base::down_ba_;
   using Base::down_bb_;
@@ -469,7 +471,7 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
 
       pool->get_subpool(i)->do_work_stealing_job(
           tpc.expert_num, nullptr,
-          [&, &tpc](int expert_id_) {
+          [&](int expert_id_) {
             const size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
 
             ggml_bf16_t* gate_dst = (ggml_bf16_t*)tpc.gate_proj + expert_id * tp_weight_elems;

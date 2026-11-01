@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include "amx_config.hpp"
@@ -133,16 +134,13 @@ struct BufferBBF16Impl {
   }
   void set_data(void* new_ptr) { b = reinterpret_cast<ggml_bf16_t*>(new_ptr); }
 
-  void from_mat(ggml_bf16_t* src, int ith, int nth) {
-    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
-    int n_block_begin = n_start;
-    int n_block_size = n_end - n_block_begin;
+  void pack_block(ggml_bf16_t* src, int src_stride, int n_block_begin, int n_block_size) {
     for (int n_begin = 0; n_begin < n_block_size; n_begin += N_STEP) {
       for (int k_block_begin = 0; k_block_begin < k; k_block_begin += K_BLOCK) {
         int k_block_size = std::min(K_BLOCK, k - k_block_begin);
         for (int k_begin = 0; k_begin < k_block_size; k_begin += K_STEP) {
           for (int i = 0; i < N_STEP; i++) {
-            __m512i* s = (__m512i*)(src + (n_block_begin + n_begin + i) * k + k_block_begin + k_begin);
+            __m512i* s = (__m512i*)(src + (n_begin + i) * src_stride + k_block_begin + k_begin);
             __m512i* d = (__m512i*)(b + n_block_begin * k + k_block_begin * n_block_size + n_begin * k_block_size +
                                     k_begin * N_STEP + i * K_STEP);
             avx512_copy_32xbf16(s, d);
@@ -151,6 +149,116 @@ struct BufferBBF16Impl {
                                            n_begin * k_block_size + k_begin * N_STEP));
           transpose_16x16_32bit((__m512i*)(b + n_block_begin * k + k_block_begin * n_block_size +
                                            n_begin * k_block_size + k_begin * N_STEP + TILE_N * K_STEP));
+        }
+      }
+    }
+  }
+
+  void from_mat(ggml_bf16_t* src, int ith, int nth) {
+    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+    int n_block_begin = n_start;
+    int n_block_size = n_end - n_block_begin;
+    pack_block(src + n_block_begin * k, k, n_block_begin, n_block_size);
+  }
+
+  void from_mat_strided(ggml_bf16_t* src, int src_stride, int ith, int nth) {
+    assert(src_stride >= k);
+    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+    int n_block_begin = n_start;
+    int n_block_size = n_end - n_block_begin;
+    if (n_block_size <= 0) return;
+    pack_block(src + (size_t)n_block_begin * src_stride, src_stride, n_block_begin, n_block_size);
+  }
+
+  void from_mat_transposed(ggml_bf16_t* src, int src_n, int src_k, int ith, int nth) {
+    assert(n == src_k && k == src_n);
+    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+    int n_block_begin = n_start;
+    int n_block_size = n_end - n_block_begin;
+    if (n_block_size <= 0) return;
+
+    thread_local std::vector<ggml_bf16_t> strip;
+    strip.resize((size_t)n_block_size * k);
+    constexpr int TILE = 32;
+    for (int c_tile = 0; c_tile < k; c_tile += TILE) {
+      int c_end = std::min(c_tile + TILE, k);
+      for (int r_tile = 0; r_tile < n_block_size; r_tile += TILE) {
+        int r_end = std::min(r_tile + TILE, n_block_size);
+        for (int c = c_tile; c < c_end; c++) {
+          for (int r = r_tile; r < r_end; r++) {
+            strip[(size_t)r * k + c] = src[(size_t)c * src_k + n_block_begin + r];
+          }
+        }
+      }
+    }
+    pack_block(strip.data(), k, n_block_begin, n_block_size);
+  }
+
+  void to_mat(ggml_bf16_t* dst, int ith, int nth) const {
+    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+    int n_block_begin = n_start;
+    int n_block_size = n_end - n_block_begin;
+    if (n_block_size <= 0) return;
+
+    alignas(64) ggml_bf16_t tile_copy[N_STEP * K_STEP];
+    for (int n_begin = 0; n_begin < n_block_size; n_begin += N_STEP) {
+      for (int k_block_begin = 0; k_block_begin < k; k_block_begin += K_BLOCK) {
+        int k_block_size = std::min(K_BLOCK, k - k_block_begin);
+        for (int k_begin = 0; k_begin < k_block_size; k_begin += K_STEP) {
+          const ggml_bf16_t* tile_src =
+              b + n_block_begin * k + k_block_begin * n_block_size + n_begin * k_block_size + k_begin * N_STEP;
+          memcpy(tile_copy, tile_src, sizeof(tile_copy));
+          transpose_16x16_32bit((__m512i*)tile_copy);
+          transpose_16x16_32bit((__m512i*)(tile_copy + TILE_N * K_STEP));
+          for (int i = 0; i < N_STEP; i++) {
+            __m512i* s = (__m512i*)(tile_copy + i * K_STEP);
+            __m512i* d = (__m512i*)(dst + (size_t)(n_block_begin + n_begin + i) * k + k_block_begin + k_begin);
+            avx512_copy_32xbf16(s, d);
+          }
+        }
+      }
+    }
+  }
+
+  void from_bb_transposed(const BufferBBF16Impl& src, int ith, int nth) {
+    assert(n == src.k && k == src.n);
+    auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+    int dst_n_block_begin = n_start;
+    int dst_n_block_size = n_end - dst_n_block_begin;
+    if (dst_n_block_size <= 0) return;
+
+    auto tile_ptr = [](ggml_bf16_t* base, int total_n, int total_k, int abs_n, int abs_k) {
+      int n_block_begin = abs_n / N_BLOCK * N_BLOCK;
+      int n_within = abs_n - n_block_begin;
+      int n_block_size = std::min(N_BLOCK, total_n - n_block_begin);
+      int k_block_begin = abs_k / K_BLOCK * K_BLOCK;
+      int k_within = abs_k - k_block_begin;
+      return base + (size_t)n_block_begin * total_k + (size_t)k_block_begin * n_block_size +
+             (size_t)n_within * std::min(K_BLOCK, total_k - k_block_begin) + (size_t)k_within * N_STEP;
+    };
+
+    alignas(64) ggml_bf16_t src_tile[N_STEP * K_STEP];
+    alignas(64) ggml_bf16_t dst_tile[N_STEP * K_STEP];
+    for (int dst_n = 0; dst_n < dst_n_block_size; dst_n += N_STEP) {
+      for (int dst_k_block = 0; dst_k_block < k; dst_k_block += K_BLOCK) {
+        int dst_k_block_size = std::min(K_BLOCK, k - dst_k_block);
+        for (int dst_k = 0; dst_k < dst_k_block_size; dst_k += K_STEP) {
+          int abs_dst_n = dst_n_block_begin + dst_n;
+          int abs_dst_k = dst_k_block + dst_k;
+          ggml_bf16_t* src_ptr = tile_ptr(src.b, src.n, src.k, abs_dst_k, abs_dst_n);
+          memcpy(src_tile, src_ptr, sizeof(src_tile));
+          transpose_16x16_32bit((__m512i*)src_tile);
+          transpose_16x16_32bit((__m512i*)(src_tile + TILE_N * K_STEP));
+
+          for (int i = 0; i < N_STEP; i++) {
+            for (int j = 0; j < K_STEP; j++) {
+              dst_tile[j * K_STEP + i] = src_tile[i * K_STEP + j];
+            }
+          }
+          transpose_16x16_32bit((__m512i*)dst_tile);
+          transpose_16x16_32bit((__m512i*)(dst_tile + TILE_N * K_STEP));
+          ggml_bf16_t* dst_ptr = tile_ptr(b, n, k, abs_dst_n, abs_dst_k);
+          memcpy(dst_ptr, dst_tile, sizeof(dst_tile));
         }
       }
     }
@@ -192,7 +300,8 @@ struct BufferBFP8Impl {
   static size_t required_size(int n, int k, int k_group_size) {
     int n_blocks_n = (n + k_group_size - 1) / k_group_size;
     int n_blocks_k = (k + k_group_size - 1) / k_group_size;
-    return sizeof(uint8_t) * n * k + sizeof(float) * n_blocks_n * n_blocks_k;
+    const size_t bytes = sizeof(uint8_t) * (size_t)n * k + sizeof(float) * (size_t)n_blocks_n * n_blocks_k;
+    return (bytes + 63) / 64 * 64;
   }
 
   /**
@@ -279,6 +388,17 @@ struct BufferBFP8Impl {
            (size_t)k_begin * N_STEP;
   }
 
+  const uint8_t* get_submat(int n, int k, int n_begin, int k_begin) const {
+    int n_block_begin = n_begin / N_BLOCK * N_BLOCK;
+    n_begin -= n_block_begin;
+    int n_block_size = std::min(N_BLOCK, n - n_block_begin);
+    int k_block_begin = k_begin / K_BLOCK * K_BLOCK;
+    k_begin -= k_block_begin;
+    int k_block_size = std::min(K_BLOCK, k - k_block_begin);
+    return b + (size_t)n_block_begin * k + (size_t)k_block_begin * n_block_size +
+           (size_t)n_begin * k_block_size + (size_t)k_begin * N_STEP;
+  }
+
   /**
    * @brief Inverse mapping for mat_offset used in to_mat
    * mat_offset = {0, 2, 4, 6, 1, 3, 5, 7}
@@ -352,6 +472,96 @@ struct BufferBFP8Impl {
       }
     }
   }
+
+  /**
+   * @brief Repack a packed block-FP8 BufferB as its logical transpose.
+   *
+   * FP8 bytes are moved without decoding or requantization. The 128x128
+   * scale grid is transposed with the weight matrix. Phase one deliberately
+   * requires complete 128x128 blocks, including each TP-local partition.
+   */
+  void from_bb_transposed(const BufferBFP8Impl& src, int ith, int nth) {
+    constexpr int FP8_BLOCK = 128;
+    if (ith < 0 || nth <= 0 || ith >= nth) {
+      throw std::invalid_argument("FP8 BufferB transpose received an invalid thread partition");
+    }
+    if (n != src.k || k != src.n) {
+      throw std::invalid_argument("FP8 BufferB transpose destination shape must be the source transpose");
+    }
+    if (k_group_size != FP8_BLOCK || src.k_group_size != FP8_BLOCK) {
+      throw std::invalid_argument("FP8 BufferB transpose requires 128x128 block scales");
+    }
+    if (N_BLOCK != FP8_BLOCK || N_STEP != 32 || K_STEP != 32 || n % FP8_BLOCK != 0 ||
+        k % FP8_BLOCK != 0 || src.n % FP8_BLOCK != 0 || src.k % FP8_BLOCK != 0) {
+      throw std::invalid_argument("FP8 BufferB transpose requires 128-aligned local matrix dimensions");
+    }
+
+    const int dst_n_blocks = n / FP8_BLOCK;
+    const int dst_k_blocks = k / FP8_BLOCK;
+    const int src_k_blocks = src.k / FP8_BLOCK;
+    const int dst_bn_begin = dst_n_blocks * ith / nth;
+    const int dst_bn_end = dst_n_blocks * (ith + 1) / nth;
+
+    for (int dst_bn = dst_bn_begin; dst_bn < dst_bn_end; ++dst_bn) {
+      for (int dst_bk = 0; dst_bk < dst_k_blocks; ++dst_bk) {
+        std::memcpy(d + (size_t)dst_bn * dst_k_blocks + dst_bk,
+                    src.d + (size_t)dst_bk * src_k_blocks + dst_bn, sizeof(float));
+      }
+    }
+
+    alignas(64) uint8_t src_tile[N_STEP * K_STEP];
+    alignas(64) uint8_t dst_tile[N_STEP * K_STEP];
+    const int dst_n_begin = dst_bn_begin * FP8_BLOCK;
+    const int dst_n_end = dst_bn_end * FP8_BLOCK;
+    for (int dst_n = dst_n_begin; dst_n < dst_n_end; dst_n += N_STEP) {
+      for (int dst_k = 0; dst_k < k; dst_k += K_STEP) {
+        unpack_packed_tile(src.get_submat(src.n, src.k, dst_k, dst_n), src_tile);
+        for (int row = 0; row < N_STEP; ++row) {
+          for (int column = 0; column < K_STEP; ++column) {
+            dst_tile[(size_t)row * K_STEP + column] = src_tile[(size_t)column * K_STEP + row];
+          }
+        }
+        pack_packed_tile(dst_tile, get_submat(n, k, dst_n, dst_k));
+      }
+    }
+  }
+
+ private:
+  static void unpack_packed_tile(const uint8_t* packed, uint8_t* logical) {
+    const uint64_t* packed_words = reinterpret_cast<const uint64_t*>(packed);
+    for (int logical_group = 0; logical_group < 8; ++logical_group) {
+      const int packed_group = mat_offset[logical_group];
+      for (int column_pair = 0; column_pair < 16; ++column_pair) {
+        const uint64_t word = packed_words[8 * column_pair + packed_group];
+        for (int row_in_group = 0; row_in_group < 4; ++row_in_group) {
+          const uint16_t pair = static_cast<uint16_t>(word >> (16 * row_in_group));
+          const size_t offset =
+              (size_t)(logical_group * 4 + row_in_group) * K_STEP + column_pair * 2;
+          std::memcpy(logical + offset, &pair, sizeof(pair));
+        }
+      }
+    }
+  }
+
+  static void pack_packed_tile(const uint8_t* logical, uint8_t* packed) {
+    uint64_t* packed_words = reinterpret_cast<uint64_t*>(packed);
+    for (int logical_group = 0; logical_group < 8; ++logical_group) {
+      const int packed_group = mat_offset[logical_group];
+      for (int column_pair = 0; column_pair < 16; ++column_pair) {
+        uint64_t word = 0;
+        for (int row_in_group = 0; row_in_group < 4; ++row_in_group) {
+          uint16_t pair;
+          const size_t offset =
+              (size_t)(logical_group * 4 + row_in_group) * K_STEP + column_pair * 2;
+          std::memcpy(&pair, logical + offset, sizeof(pair));
+          word |= static_cast<uint64_t>(pair) << (16 * row_in_group);
+        }
+        packed_words[8 * column_pair + packed_group] = word;
+      }
+    }
+  }
+
+ public:
 };
 
 // ============================================================================

@@ -376,6 +376,7 @@ struct MOESFTConfig : public GeneralMOEConfig {
   // LoRA configuration
   int lora_rank = 16;
   float lora_alpha = 32.0f;
+  float lora_dropout = 0.0f;
   float lora_scaling() const { return lora_alpha / lora_rank; }
 
   // LoRA weight pointers (directly pointing to Python tensor memory, zero-copy)
@@ -386,6 +387,19 @@ struct MOESFTConfig : public GeneralMOEConfig {
   void* up_lora_b = nullptr;    // [expert_num, intermediate_size, lora_rank]
   void* down_lora_a = nullptr;  // [expert_num, lora_rank, intermediate_size]
   void* down_lora_b = nullptr;  // [expert_num, hidden_size, lora_rank]
+
+  // Full weight gradient configuration
+  bool full_weight_grad = false;
+
+  // Opt in to the C++-authoritative optimizer-gradient lifecycle. Keep this
+  // disabled by default so existing callers retain legacy buffer semantics.
+  bool authoritative_optimizer_grads = false;
+
+  // Base weight gradient buffer pointers (directly pointing to Python tensor memory, zero-copy)
+  // Only used when full_weight_grad == true
+  void* grad_gate_proj = nullptr;  // [expert_num, intermediate_size, hidden_size]
+  void* grad_up_proj = nullptr;    // [expert_num, intermediate_size, hidden_size]
+  void* grad_down_proj = nullptr;  // [expert_num, hidden_size, intermediate_size]
 
   MOESFTConfig() : GeneralMOEConfig() {}
 

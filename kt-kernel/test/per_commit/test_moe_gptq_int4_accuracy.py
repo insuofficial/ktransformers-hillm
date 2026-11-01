@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
-"""GPTQ INT4 MoE accuracy tests for KT-Kernel x86 backends."""
+"""GPTQ INT4 MoE accuracy tests for KT-Kernel backends."""
 
 import importlib.util
 import os
@@ -12,6 +12,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ci.ci_register import register_cpu_ci
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
+if os.environ.get("KT_KERNEL_EXT_DIR"):
+    sys.path.insert(0, os.environ["KT_KERNEL_EXT_DIR"])
 
 register_cpu_ci(est_time=120, suite="default")
 
@@ -151,19 +153,23 @@ def available_backends():
     if hasattr(kt_kernel_ext.moe, "AVX2GPTQInt4_MOE"):
         backends.append(("AVX2GPTQInt4_MOE", kt_kernel_ext.moe.AVX2GPTQInt4_MOE, 0.12))
 
-    if hasattr(kt_kernel_ext.moe, "AVXVNNI256GPTQInt4_MOE"):
+    has_avx_vnni = False
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            has_avx_vnni = any(("avx_vnni" in line or "avxvnni" in line) for line in f if line.startswith("flags"))
+    except OSError:
         has_avx_vnni = False
-        try:
-            with open("/proc/cpuinfo", "r") as f:
-                has_avx_vnni = any(("avx_vnni" in line or "avxvnni" in line) for line in f if line.startswith("flags"))
-        except OSError:
-            has_avx_vnni = False
-        if has_avx_vnni:
-            backends.append(("AVXVNNI256GPTQInt4_MOE", kt_kernel_ext.moe.AVXVNNI256GPTQInt4_MOE, 0.20))
+    if hasattr(kt_kernel_ext.moe, "AVXVNNI256GPTQInt4_MOE") and has_avx_vnni:
+        backends.append(("AVXVNNI256GPTQInt4_MOE", kt_kernel_ext.moe.AVXVNNI256GPTQInt4_MOE, 0.20))
+    if hasattr(kt_kernel_ext.moe, "AVXVNNI256GPTQInt4Packed_MOE") and has_avx_vnni:
+        backends.append(("AVXVNNI256GPTQInt4Packed_MOE", kt_kernel_ext.moe.AVXVNNI256GPTQInt4Packed_MOE, 0.20))
+    if os.environ.get("KT_TEST_SYCL_GPTQ_INT4") == "1" and hasattr(kt_kernel_ext.moe, "SYCLGPTQInt4_MOE"):
+        backends.append(("SYCLGPTQInt4_MOE", kt_kernel_ext.moe.SYCLGPTQInt4_MOE, 0.05))
     return backends
 
 
-def run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen):
+def run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen_cases):
+    torch.manual_seed(20260716)
     physical_to_logical_map = torch.tensor(range(expert_num), dtype=torch.int64).contiguous()
     cpu_infer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
 
@@ -238,48 +244,94 @@ def run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen):
         cpu_infer.submit(moe.load_weights_task(physical_to_logical_map.data_ptr()))
         cpu_infer.sync()
 
-        print(f"\n--- {backend_name} (qlen={qlen}) ---")
-        for i in range(validation_iter):
-            expert_ids = torch.stack(
-                [torch.randperm(expert_num)[:num_experts_per_tok] for _ in range(qlen)]
-            ).contiguous()
-            weights = torch.rand((qlen, num_experts_per_tok), dtype=torch.float32).contiguous()
-            input_data = (torch.randn((qlen, hidden_size), dtype=torch.float32) / 100.0).to(torch.bfloat16).contiguous()
-            output = torch.empty((qlen, hidden_size), dtype=torch.bfloat16).contiguous()
-
-            bsz_tensor = torch.tensor([qlen], dtype=torch.int32)
-            cpu_infer.submit(
-                moe.forward_task(
-                    bsz_tensor.data_ptr(),
-                    num_experts_per_tok,
-                    expert_ids.data_ptr(),
-                    weights.data_ptr(),
-                    input_data.data_ptr(),
-                    output.data_ptr(),
-                    False,
+        for qlen, fixed_experts in qlen_cases:
+            print(f"\n--- {backend_name} (qlen={qlen}) ---")
+            for i in range(validation_iter):
+                if fixed_experts:
+                    expert_ids = torch.tensor([[0, 1]] * qlen, dtype=torch.int64).contiguous()
+                else:
+                    expert_ids = torch.stack(
+                        [torch.randperm(expert_num)[:num_experts_per_tok] for _ in range(qlen)]
+                    ).contiguous()
+                weights = torch.rand((qlen, num_experts_per_tok), dtype=torch.float32).contiguous()
+                input_data = (
+                    (torch.randn((qlen, hidden_size), dtype=torch.float32) / 100.0).to(torch.bfloat16).contiguous()
                 )
-            )
-            cpu_infer.sync()
+                output = torch.empty((qlen, hidden_size), dtype=torch.bfloat16).contiguous()
 
-            ref_output = moe_torch(input_data.float(), expert_ids, weights, gate_deq, up_deq, down_deq).to(
-                torch.bfloat16
-            )
-            diff = torch.mean(torch.abs(output.float() - ref_output.float())) / (
-                torch.mean(torch.abs(ref_output.float())) + 1e-8
-            )
-            print(f"  Iteration {i}: diff = {diff.item():.6f}")
-            assert diff < threshold, f"{backend_name} accuracy test failed: diff={diff.item():.6f} >= {threshold}"
+                bsz_tensor = torch.tensor([qlen], dtype=torch.int32)
+                cpu_infer.submit(
+                    moe.forward_task(
+                        bsz_tensor.data_ptr(),
+                        num_experts_per_tok,
+                        expert_ids.data_ptr(),
+                        weights.data_ptr(),
+                        input_data.data_ptr(),
+                        output.data_ptr(),
+                        False,
+                    )
+                )
+                cpu_infer.sync()
+
+                ref_output = moe_torch(input_data.float(), expert_ids, weights, gate_deq, up_deq, down_deq).to(
+                    torch.bfloat16
+                )
+                diff = torch.mean(torch.abs(output.float() - ref_output.float())) / (
+                    torch.mean(torch.abs(ref_output.float())) + 1e-8
+                )
+                print(f"  Iteration {i}: diff = {diff.item():.6f}")
+                assert diff < threshold, f"{backend_name} accuracy test failed: diff={diff.item():.6f} >= {threshold}"
 
 
 def test_gptq_int4_accuracy():
     backends = available_backends()
     if not backends:
-        print("Skipping GPTQ INT4 accuracy tests: no x86 GPTQ backend available")
+        print("Skipping GPTQ INT4 accuracy tests: no GPTQ backend available")
         return
 
     for backend_name, backend_cls, threshold in backends:
-        run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen=1)
-        run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen=16)
+        qlen_cases = [(1, False), (16, False)]
+        if backend_name == "SYCLGPTQInt4_MOE":
+            # Reuse one instance across decode, sparse/dense threshold edges,
+            # dense prefill, and decode again to exercise scratch state changes.
+            qlen_cases.extend([(32, True), (33, True), (40, True), (1, False)])
+        run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen_cases)
+
+
+def test_sycl_preflight_honors_oneapi_device_selector(monkeypatch):
+    amx_utils = load_amx_utils()
+    monkeypatch.setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0")
+    monkeypatch.setattr(amx_utils.glob, "glob", lambda _: ["/dev/dri/renderD128"])
+    monkeypatch.setattr(amx_utils.os, "access", lambda *_: False)
+
+    amx_utils._preflight_sycl_device()
+
+
+def test_sycl_preflight_rejects_inaccessible_render_nodes(monkeypatch):
+    amx_utils = load_amx_utils()
+    monkeypatch.delenv("ONEAPI_DEVICE_SELECTOR", raising=False)
+    monkeypatch.setattr(amx_utils.glob, "glob", lambda _: ["/dev/dri/renderD128"])
+    monkeypatch.setattr(amx_utils.os, "access", lambda *_: False)
+
+    with pytest.raises(RuntimeError, match="ONEAPI_DEVICE_SELECTOR"):
+        amx_utils._preflight_sycl_device()
+
+
+def test_sycl_preflight_accepts_accessible_render_node(monkeypatch):
+    amx_utils = load_amx_utils()
+    monkeypatch.delenv("ONEAPI_DEVICE_SELECTOR", raising=False)
+    monkeypatch.setattr(amx_utils.glob, "glob", lambda _: ["/dev/dri/renderD128"])
+    monkeypatch.setattr(amx_utils.os, "access", lambda *_: True)
+
+    amx_utils._preflight_sycl_device()
+
+
+def test_sycl_preflight_accepts_missing_render_nodes(monkeypatch):
+    amx_utils = load_amx_utils()
+    monkeypatch.delenv("ONEAPI_DEVICE_SELECTOR", raising=False)
+    monkeypatch.setattr(amx_utils.glob, "glob", lambda _: [])
+
+    amx_utils._preflight_sycl_device()
 
 
 def test_gptq_int4_backend_selection_falls_back_to_avx2_for_large_group_size(monkeypatch):
@@ -291,6 +343,8 @@ def test_gptq_int4_backend_selection_falls_back_to_avx2_for_large_group_size(mon
     monkeypatch.setattr(amx_utils, "AVXVNNI256GPTQInt4_MOE", fake_avxvnni_backend)
     monkeypatch.setattr(amx_utils, "_HAS_AVX2_GPTQ_INT4_SUPPORT", True)
     monkeypatch.setattr(amx_utils, "_HAS_AVXVNNI256_GPTQ_INT4_SUPPORT", True)
+    # Pinned off: this test exercises the pre-unpacked-backend routing only.
+    monkeypatch.setattr(amx_utils, "_HAS_AVXVNNI256_PACKED_GPTQ_INT4_SUPPORT", False)
     monkeypatch.setattr(amx_utils, "_HOST_HAS_AVX_VNNI", True)
     monkeypatch.delenv("KT_GPTQ_INT4_BACKEND", raising=False)
 
@@ -307,6 +361,89 @@ def test_gptq_int4_backend_selection_rejects_forced_avxvnni_with_large_group_siz
 
     with pytest.raises(RuntimeError, match="group_size=512 is unsupported"):
         amx_utils._select_gptq_int4_backend(512)
+
+
+def test_gptq_int4_backend_selection_prefers_packed_backend(monkeypatch):
+    amx_utils = load_amx_utils()
+    fake_avx2_backend = object()
+    fake_avxvnni_backend = object()
+    fake_packed_backend = object()
+
+    monkeypatch.setattr(amx_utils, "AVX2GPTQInt4_MOE", fake_avx2_backend)
+    monkeypatch.setattr(amx_utils, "AVXVNNI256GPTQInt4_MOE", fake_avxvnni_backend)
+    monkeypatch.setattr(amx_utils, "AVXVNNI256GPTQInt4Packed_MOE", fake_packed_backend)
+    monkeypatch.setattr(amx_utils, "_HAS_AVX2_GPTQ_INT4_SUPPORT", True)
+    monkeypatch.setattr(amx_utils, "_HAS_AVXVNNI256_GPTQ_INT4_SUPPORT", True)
+    monkeypatch.setattr(amx_utils, "_HAS_AVXVNNI256_PACKED_GPTQ_INT4_SUPPORT", True)
+    monkeypatch.setattr(amx_utils, "_HOST_HAS_AVX_VNNI", True)
+    monkeypatch.delenv("KT_GPTQ_INT4_BACKEND", raising=False)
+
+    # Default: the packed (int4-resident) backend wins, including group sizes
+    # beyond the pre-unpacked VNNI backend's 256 cap.
+    assert amx_utils._select_gptq_int4_backend(128) is fake_packed_backend
+    assert amx_utils._select_gptq_int4_backend(512) is fake_packed_backend
+
+    # Forced values: avxvnni keeps the pre-unpacked backend (escape hatch),
+    # packed forces the packed backend, avx2 forces the plain AVX2 backend.
+    monkeypatch.setenv("KT_GPTQ_INT4_BACKEND", "avxvnni")
+    assert amx_utils._select_gptq_int4_backend(128) is fake_avxvnni_backend
+    monkeypatch.setenv("KT_GPTQ_INT4_BACKEND", "packed")
+    assert amx_utils._select_gptq_int4_backend(512) is fake_packed_backend
+    monkeypatch.setenv("KT_GPTQ_INT4_BACKEND", "avx2")
+    assert amx_utils._select_gptq_int4_backend(128) is fake_avx2_backend
+
+
+def test_gptq_int4_backend_selection_packed_falls_back_without_vnni(monkeypatch):
+    amx_utils = load_amx_utils()
+    fake_avx2_backend = object()
+
+    monkeypatch.setattr(amx_utils, "AVX2GPTQInt4_MOE", fake_avx2_backend)
+    monkeypatch.setattr(amx_utils, "_HAS_AVX2_GPTQ_INT4_SUPPORT", True)
+    monkeypatch.setattr(amx_utils, "_HAS_AVXVNNI256_PACKED_GPTQ_INT4_SUPPORT", True)
+    monkeypatch.setattr(amx_utils, "_HOST_HAS_AVX_VNNI", False)
+    monkeypatch.delenv("KT_GPTQ_INT4_BACKEND", raising=False)
+
+    assert amx_utils._select_gptq_int4_backend(128) is fake_avx2_backend
+
+
+def test_gptq_int4_backend_selection_rejects_forced_packed_with_bad_group_size(monkeypatch):
+    amx_utils = load_amx_utils()
+
+    monkeypatch.setattr(amx_utils, "_HAS_AVXVNNI256_PACKED_GPTQ_INT4_SUPPORT", True)
+    monkeypatch.setattr(amx_utils, "_HOST_HAS_AVX_VNNI", True)
+    monkeypatch.setenv("KT_GPTQ_INT4_BACKEND", "packed")
+
+    with pytest.raises(RuntimeError, match="group_size=4096 is unsupported"):
+        amx_utils._select_gptq_int4_backend(4096)
+    with pytest.raises(RuntimeError, match="group_size=100 is unsupported"):
+        amx_utils._select_gptq_int4_backend(100)
+
+
+def test_gptq_int4_packed_backend_large_hidden_heap_staging(monkeypatch):
+    """hidden_size > 2048 exercises the packed backend's heap staging path
+    (k <= 2048 stages in L1-resident stack buffers; larger k auto-sizes a
+    heap buffer, so no hidden/intermediate limit exists)."""
+    packed = [(n, c, t) for (n, c, t) in available_backends() if n == "AVXVNNI256GPTQInt4Packed_MOE"]
+    if not packed:
+        pytest.skip("packed backend not available on this host")
+    name, backend_cls, threshold = packed[0]
+    monkeypatch.setattr(sys.modules[__name__], "hidden_size", 2176)  # > 2048 -> heap staging
+    run_backend_accuracy_test(name, backend_cls, threshold, [(1, False), (16, False)])
+
+
+def test_gptq_int4_packed_backend_nonaligned_task_split(monkeypatch):
+    """hidden_size=544 with group_size=32 makes the down projection's output
+    dimension not divisible by 64: the packed backend splits tasks at
+    8-column jb-block granularity, so the remainder blocks distribute across
+    tasks and every task still owns whole 8-column blocks."""
+    packed = [(n, c, t) for (n, c, t) in available_backends() if n == "AVXVNNI256GPTQInt4Packed_MOE"]
+    if not packed:
+        pytest.skip("packed backend not available on this host")
+    name, backend_cls, threshold = packed[0]
+    mod = sys.modules[__name__]
+    monkeypatch.setattr(mod, "hidden_size", 544)  # %32 == 0 but %64 != 0
+    monkeypatch.setattr(mod, "group_size", 32)
+    run_backend_accuracy_test(name, backend_cls, threshold, [(1, False), (16, False)])
 
 
 if __name__ == "__main__":

@@ -19,8 +19,12 @@
 #include <cstddef>
 #include <cstring>
 
+#include "bf16_sumsq.h"
 #include "cpu_backend/cpuinfer.h"
 #include "cpu_backend/worker_pool.h"
+#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
+#include "cpu_backend/ascend_callback_worker.h"
+#endif
 #include "operators/common.hpp"
 
 #if defined(USE_MOE_KERNEL)
@@ -45,12 +49,13 @@ static const bool _is_plain_ = false;
 #include "operators/amx/awq-moe.hpp"
 #include "operators/amx/bf16-moe.hpp"            // Native BF16 MoE using CRTP pattern, with fallback for AVX512F
 #include "operators/amx/fp4-moe.hpp"             // MXFP4 MoE: FP4 E2M1 weights × BF16 activations
-#include "operators/amx/mxfp8-moe.hpp"           // MXFP8 MoE: FP8 E4M3fn weights × BF16 activations (MiniMax M3)
 #include "operators/amx/fp8-moe.hpp"             // FP8 MoE requires AVX512 BF16 support, with fallback for AVX512F+BW
 #include "operators/amx/fp8-perchannel-moe.hpp"  // FP8 Per-Channel MoE for GLM-4.7-FP8
 #include "operators/amx/k2-moe.hpp"
 #include "operators/amx/la/amx_kernels.hpp"
 #include "operators/amx/moe.hpp"
+#include "operators/amx/mxfp8-moe.hpp"  // MXFP8 MoE: FP8 E4M3fn weights × BF16 activations (MiniMax M3)
+#include "operators/amx/sft-k2-moe.hpp"
 #include "operators/amx/sft_moe.hpp"
 #include "operators/moe-sft-tp.hpp"
 #endif
@@ -60,10 +65,20 @@ static const bool _is_plain_ = false;
 #include "operators/avx2/fp8-moe.hpp"
 #include "operators/avx2/gptq_int4-moe.hpp"
 #include "operators/avx2/gptq_int4_avxvnni-moe.hpp"
+#include "operators/avx2/gptq_int4_avxvnni_packed-moe.hpp"
 #include "operators/avx2/mxfp4-moe.hpp"
+#include "operators/avx2/sft_mxfp4-moe.hpp"
+#include "operators/avx2/sft_rawint4-moe.hpp"
+#if !defined(USE_AMX_AVX_KERNEL)
+#include "operators/moe-sft-tp.hpp"
+#endif
 #include "operators/avx2/mxfp8-moe.hpp"
 #include "operators/avx2/rawint4-moe.hpp"
 #include "operators/avx2/rawint4_avxvnni-moe.hpp"
+#endif
+#if defined(USE_SYCL)
+#include "operators/sycl/gptq_int4_sycl-moe.hpp"
+#include "operators/sycl/gptq_int4_xmx-moe.hpp"
 #endif
 
 #include <pybind11/stl.h>  // std::vector/std::pair/std::string conversions
@@ -72,6 +87,7 @@ static const bool _is_plain_ = false;
 #include <memory>
 #include <type_traits>
 
+#include "fp8_layerwise_transport.hpp"
 #include "operators/kvcache/kvcache.h"
 #include "operators/llamafile/linear.h"
 #include "operators/llamafile/mla.hpp"
@@ -299,7 +315,7 @@ class MOEBindings {
   };
 };
 
-#if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
+#if defined(__x86_64__)
 template <class T>
 class MOESFTBindings {
  public:
@@ -376,22 +392,41 @@ class MOESFTBindings {
       intptr_t grad_down_lora_a;
       intptr_t grad_down_lora_b;
       intptr_t grad_weights;
+      intptr_t grad_gate_proj;
+      intptr_t grad_up_proj;
+      intptr_t grad_down_proj;
+      bool accumulate_optimizer_grads;
+      float optimizer_grad_scale;
     };
     static void inner(void* args) {
       Args* args_ = (Args*)args;
       args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::backward_binding, args_->moe, args_->grad_output, args_->grad_input,
                                args_->grad_gate_lora_a, args_->grad_gate_lora_b, args_->grad_up_lora_a,
                                args_->grad_up_lora_b, args_->grad_down_lora_a, args_->grad_down_lora_b,
-                               args_->grad_weights);
+                               args_->grad_weights, args_->grad_gate_proj, args_->grad_up_proj, args_->grad_down_proj,
+                               args_->accumulate_optimizer_grads, args_->optimizer_grad_scale);
     }
-    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe, intptr_t grad_output,
-                                                            intptr_t grad_input, intptr_t grad_gate_lora_a,
-                                                            intptr_t grad_gate_lora_b, intptr_t grad_up_lora_a,
-                                                            intptr_t grad_up_lora_b, intptr_t grad_down_lora_a,
-                                                            intptr_t grad_down_lora_b, intptr_t grad_weights) {
-      Args* args = new Args{nullptr,          moe.get(),        grad_output,    grad_input,
-                            grad_gate_lora_a, grad_gate_lora_b, grad_up_lora_a, grad_up_lora_b,
-                            grad_down_lora_a, grad_down_lora_b, grad_weights};
+    static std::pair<intptr_t, intptr_t> cpuinfer_interface(
+        std::shared_ptr<TP_MOE_SFT<T>> moe, intptr_t grad_output, intptr_t grad_input, intptr_t grad_gate_lora_a,
+        intptr_t grad_gate_lora_b, intptr_t grad_up_lora_a, intptr_t grad_up_lora_b, intptr_t grad_down_lora_a,
+        intptr_t grad_down_lora_b, intptr_t grad_weights, intptr_t grad_gate_proj, intptr_t grad_up_proj,
+        intptr_t grad_down_proj, bool accumulate_optimizer_grads = false, float optimizer_grad_scale = 1.0f) {
+      Args* args = new Args{nullptr,
+                            moe.get(),
+                            grad_output,
+                            grad_input,
+                            grad_gate_lora_a,
+                            grad_gate_lora_b,
+                            grad_up_lora_a,
+                            grad_up_lora_b,
+                            grad_down_lora_a,
+                            grad_down_lora_b,
+                            grad_weights,
+                            grad_gate_proj,
+                            grad_up_proj,
+                            grad_down_proj,
+                            accumulate_optimizer_grads,
+                            optimizer_grad_scale};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };
@@ -442,21 +477,36 @@ void bind_moe_sft_module(py::module_& moe_module, const char* name) {
       .def("warm_up_task", &MoeBindings::WarmUpBindings::cpuinfer_interface)
       .def("load_weights_task", &MoeBindings::LoadWeightsBindings::cpuinfer_interface)
       .def("forward_sft_task", &MoeBindings::ForwardSFTBindings::cpuinfer_interface)
-      .def("backward_task", &MoeBindings::BackwardBindings::cpuinfer_interface)
+      .def("backward_task", &MoeBindings::BackwardBindings::cpuinfer_interface, py::arg("grad_output"),
+           py::arg("grad_input"), py::arg("grad_gate_lora_a"), py::arg("grad_gate_lora_b"), py::arg("grad_up_lora_a"),
+           py::arg("grad_up_lora_b"), py::arg("grad_down_lora_a"), py::arg("grad_down_lora_b"), py::arg("grad_weights"),
+           py::arg("grad_gate_proj"), py::arg("grad_up_proj"), py::arg("grad_down_proj"),
+           py::arg("accumulate_optimizer_grads") = false, py::arg("optimizer_grad_scale") = 1.0f)
       .def("update_lora_weights_task", &MoeBindings::UpdateLoRAWeightsBindings::cpuinfer_interface)
       .def("warm_up", &MoeClass::warm_up)
       .def("load_weights", &MoeClass::load_weights)
       .def("forward_sft", &MoeClass::forward_sft_binding)
-      .def("backward", &MoeClass::backward_binding)
+      .def("backward", &MoeClass::backward_binding, py::arg("grad_output"), py::arg("grad_input"),
+           py::arg("grad_gate_lora_a"), py::arg("grad_gate_lora_b"), py::arg("grad_up_lora_a"),
+           py::arg("grad_up_lora_b"), py::arg("grad_down_lora_a"), py::arg("grad_down_lora_b"), py::arg("grad_weights"),
+           py::arg("grad_gate_proj"), py::arg("grad_up_proj"), py::arg("grad_down_proj"),
+           py::arg("accumulate_optimizer_grads") = false, py::arg("optimizer_grad_scale") = 1.0f)
       .def("update_lora_weights", &MoeClass::update_lora_weights_binding)
       .def("prepare_and_save_bwd",
            [](MoeClass& self, intptr_t gate, intptr_t up, intptr_t down, const std::string& path) {
              self.prepare_and_save_bwd((void*)gate, (void*)up, (void*)down, path);
            })
       .def("submit_backward_repack", &MoeClass::submit_backward_repack)
-      .def("wait_backward_repack", &MoeClass::wait_backward_repack);
+      .def("wait_backward_repack", &MoeClass::wait_backward_repack)
+      .def("get_profile_stats", &MoeClass::get_profile_stats, py::arg("reset") = false)
+      .def("reset_profile_stats", &MoeClass::reset_profile_stats)
+      // Update base weight BF16 pointers for reload_base_weights (full mode training)
+      // After calling this, call load_weights_task() to re-quantize BF16->AMX
+      .def("set_base_weight_pointers", [](MoeClass& self, intptr_t gate, intptr_t up, intptr_t down) {
+        self.set_base_weight_pointers((void*)gate, (void*)up, (void*)down);
+      });
 }
-#endif  // defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
+#endif  // defined(__x86_64__)
 
 template <typename MoeTP>
 void bind_moe_module(py::module_& moe_module, const char* name) {
@@ -496,6 +546,17 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       // Pure CPU-compute time (ns) of the most recent forward task, measured on the
       // worker thread. Used by gen_config to calibrate cpu_* as compute-only.
       .def("last_compute_ns", &MoeClass::last_compute_ns);
+
+  if constexpr (requires(MoeClass& instance) {
+                  instance.profile_snapshot();
+                  instance.reset_profile();
+                }) {
+    moe_cls.def("profile_snapshot", &MoeClass::profile_snapshot).def("reset_profile", &MoeClass::reset_profile);
+  }
+
+  if constexpr (requires { MoeClass::implementation_revision(); }) {
+    moe_cls.def_static("implementation_revision", &MoeClass::implementation_revision);
+  }
 
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
@@ -540,6 +601,24 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
     moe_cls.def("write_weight_scale_to_buffer_task", &WriteWeightScaleToBufferBindings::cpuinfer_interface,
                 py::arg("gpu_tp_count"), py::arg("expert_id"), py::arg("w13_weight_ptrs"), py::arg("w13_scale_ptrs"),
                 py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
+
+    moe_cls.def(
+        "run_layerwise_fp8_batch",
+        [](std::shared_ptr<MoeClass> moe, const std::shared_ptr<kt::layerwise::FP8LayerwiseTransport>& transport,
+           std::uint64_t epoch, std::int64_t layer_id, int expert_count) {
+          if (!transport) throw std::invalid_argument("FP8 layerwise transport is null");
+          const int tp_size = transport->tp_size();
+          transport->run_producer(epoch, layer_id, expert_count,
+                                  [moe, tp_size](int expert_id, const std::vector<std::uintptr_t>& w13_weight_ptrs,
+                                                 const std::vector<std::uintptr_t>& w13_scale_ptrs,
+                                                 const std::vector<std::uintptr_t>& w2_weight_ptrs,
+                                                 const std::vector<std::uintptr_t>& w2_scale_ptrs) {
+                                    moe->write_weight_scale_to_buffer(tp_size, expert_id, w13_weight_ptrs,
+                                                                      w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+                                  });
+        },
+        py::arg("transport"), py::arg("epoch"), py::arg("layer_id"), py::arg("expert_count"),
+        py::call_guard<py::gil_scoped_release>());
   }
 
   // Bind gate_up_task for MoE types that support it. HiLLM's shard tier: gate_up +
@@ -583,6 +662,104 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {
+  m.def("_bf16_sumsq_ptr", &bf16_sumsq_ptr, py::arg("data_ptr"), py::arg("numel"),
+        py::call_guard<py::gil_scoped_release>());
+#if defined(HAVE_AMX)
+  m.attr("__cpu_variant__") = "amx";
+  m.attr("__int8_kernel__") = "amx-int8";
+#elif defined(__AVX512BF16__) && defined(__AVX512VNNI__)
+  m.attr("__cpu_variant__") = "avx512_bf16";
+  m.attr("__int8_kernel__") = amx::int8_vnni_backend_name();
+#elif defined(__AVX512VBMI__)
+  m.attr("__cpu_variant__") = "avx512_vbmi";
+  m.attr("__int8_kernel__") = "unsupported";
+#elif defined(__AVX512VNNI__)
+  m.attr("__cpu_variant__") = "avx512_vnni";
+  m.attr("__int8_kernel__") = "unsupported";
+#elif defined(__AVX512F__)
+  m.attr("__cpu_variant__") = "avx512_base";
+  m.attr("__int8_kernel__") = "unsupported";
+#else
+  m.attr("__cpu_variant__") = "avx2";
+  m.attr("__int8_kernel__") = "unsupported";
+#endif
+  m.attr("__int8_weight_layout__") = "kt-int8-n32-k64-vnni-v1";
+#if defined(USE_AMX_AVX_KERNEL) && defined(__AVX512BF16__)
+  m.attr("__rawint4_kernel__") = "amx-int4-kgroup-g32";
+#elif defined(__x86_64__) && !defined(USE_AMX_AVX_KERNEL)
+  m.attr("__rawint4_kernel__") = "avx2-int4-kgroup-g32";
+#else
+  m.attr("__rawint4_kernel__") = "unsupported";
+#endif
+  m.attr("__rawint4_weight_layout__") = "compressed-tensors-rawint4-g32-v1";
+#if defined(__AVX512BF16__) && defined(__AVX512VBMI__)
+  m.attr("__fp8_kernel__") = "avx512-fp8-decode-bf16";
+#else
+  m.attr("__fp8_kernel__") = "unsupported";
+#endif
+  m.attr("__fp8_weight_layout__") = "block-e4m3-128x128";
+  m.attr("FP8_LAYERWISE_CONTROL_BYTES") = kt::layerwise::kFP8LayerwiseControlBytes;
+  m.attr("FP8_LAYERWISE_MAX_TP_SIZE") = kt::layerwise::kFP8LayerwiseMaxTPSize;
+
+  m.def("initialize_fp8_layerwise_control", &kt::layerwise::initialize_fp8_layerwise_control, py::arg("control_ptr"),
+        py::arg("control_size"), py::arg("tp_size"));
+
+  py::class_<kt::layerwise::FP8LayerwiseTransport, std::shared_ptr<kt::layerwise::FP8LayerwiseTransport>>(
+      m, "FP8LayerwiseTransport")
+      .def(py::init<std::uintptr_t, std::size_t, int, int, int, const std::vector<std::uintptr_t>&,
+                    const std::vector<std::uintptr_t>&, const std::vector<std::uintptr_t>&,
+                    const std::vector<std::size_t>&, int, std::uint64_t>(),
+           py::arg("control_ptr"), py::arg("control_size"), py::arg("rank"), py::arg("tp_size"), py::arg("cuda_device"),
+           py::arg("local_host_ptrs"), py::arg("local_gpu_ptrs"), py::arg("all_rank_host_ptrs"),
+           py::arg("expert_nbytes"), py::arg("num_experts"), py::arg("timeout_ms") = 60000)
+      .def("join", &kt::layerwise::FP8LayerwiseTransport::join, py::arg("epoch"), py::arg("layer_id"),
+           py::arg("expert_count"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "wait",
+          [](kt::layerwise::FP8LayerwiseTransport& transport, std::uint64_t epoch) {
+            kt::layerwise::FP8LayerwiseStats stats;
+            {
+              py::gil_scoped_release release;
+              stats = transport.wait(epoch);
+            }
+            py::dict result;
+            result["epoch"] = stats.epoch;
+            result["layer_id"] = stats.layer_id;
+            result["expert_count"] = stats.expert_count;
+            result["rank"] = stats.rank;
+            result["writer_ms"] = stats.writer_ms;
+            result["slot_wait_ms"] = stats.slot_wait_ms;
+            result["h2d_ms"] = stats.h2d_ms;
+            result["total_ms"] = stats.total_ms;
+            result["bytes"] = stats.bytes;
+            result["poisoned"] = stats.poisoned;
+            result["error_code"] = stats.error_code;
+            result["error_rank"] = stats.error_rank;
+            result["error_message"] = stats.error_message;
+            return result;
+          },
+          py::arg("epoch"))
+      .def("close", &kt::layerwise::FP8LayerwiseTransport::close, py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly("rank", &kt::layerwise::FP8LayerwiseTransport::rank)
+      .def_property_readonly("tp_size", &kt::layerwise::FP8LayerwiseTransport::tp_size)
+      .def_property_readonly("num_experts", &kt::layerwise::FP8LayerwiseTransport::num_experts)
+      .def_property_readonly("closed", &kt::layerwise::FP8LayerwiseTransport::closed);
+
+#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
+  m.def(
+      "init_ascend_callback_worker", []() { kt::ascend::ensure_callback_worker(nullptr); },
+      "Start ACL aclrtProcessReport worker for stream callbacks (Ascend NPU).");
+  m.def(
+      "subscribe_ascend_stream",
+      [](intptr_t stream_handle) {
+        kt::ascend::ensure_stream_subscribed(reinterpret_cast<aclrtStream>(stream_handle));
+      },
+      py::arg("stream_handle"), "Subscribe an aclrtStream with the global callback worker.");
+  m.def("shutdown_ascend_callback_worker", &kt::ascend::shutdown_callback_worker,
+        "Stop the ACL callback worker thread.");
+  m.def("is_ascend_callback_worker_running", &kt::ascend::callback_worker_running,
+        "True iff the ACL callback worker is started and dispatching reports.");
+#endif
   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
       .def(py::init<>())
@@ -883,12 +1060,18 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       }))
       .def_readwrite("lora_rank", &MOESFTConfig::lora_rank)
       .def_readwrite("lora_alpha", &MOESFTConfig::lora_alpha)
+      .def_readwrite("lora_dropout", &MOESFTConfig::lora_dropout)
       .DEF_PTR_PROPERTY(MOESFTConfig, gate_lora_a)
       .DEF_PTR_PROPERTY(MOESFTConfig, gate_lora_b)
       .DEF_PTR_PROPERTY(MOESFTConfig, up_lora_a)
       .DEF_PTR_PROPERTY(MOESFTConfig, up_lora_b)
       .DEF_PTR_PROPERTY(MOESFTConfig, down_lora_a)
-      .DEF_PTR_PROPERTY(MOESFTConfig, down_lora_b);
+      .DEF_PTR_PROPERTY(MOESFTConfig, down_lora_b)
+      .def_readwrite("full_weight_grad", &MOESFTConfig::full_weight_grad)
+      .def_readwrite("authoritative_optimizer_grads", &MOESFTConfig::authoritative_optimizer_grads)
+      .DEF_PTR_PROPERTY(MOESFTConfig, grad_gate_proj)
+      .DEF_PTR_PROPERTY(MOESFTConfig, grad_up_proj)
+      .DEF_PTR_PROPERTY(MOESFTConfig, grad_down_proj);
 
   py::class_<MoE_Interface, std::shared_ptr<MoE_Interface>>(moe_module, "MoE_Interface");
 
@@ -900,6 +1083,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AMX_MOE_TP<amx::GemmKernel224Int4_1>>(moe_module, "AMXInt4_1_MOE");
   bind_moe_module<AMX_AWQ_MOE_TP<amx::GemmKernel224Int4_1_LowKGroup>>(moe_module, "AMXInt4_1KGroup_MOE");
   bind_moe_module<AMX_K2_MOE_TP<amx::GemmKernel224Int4SmallKGroup>>(moe_module, "AMXInt4_KGroup_MOE");
+  bind_moe_module<AMX_K2_MOE_TP<amx::GemmKernel224Int4SmallKGroupBlocked>>(moe_module, "AMXInt4_KGroupBlocked_MOE");
 #if defined(__AVX512F__)
   bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernel224BF16>>(moe_module, "AMXBF16_MOE");
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
@@ -909,16 +1093,20 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 #endif
 #if defined(__AVX512BF16__)
   // SFT MoE with LoRA support (BF16, INT8, INT4, AWQ, K2)
-  bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224BF>>(moe_module, "AMXBF16_SFT_MOE");
+  bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224BF16, AMX_BF16_MOE_TP>>(moe_module, "AMXBF16_SFT_MOE");
+  bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup, AMX_FP4_MOE_TP>>(moe_module, "MXFP4_SFT_MOE");
+#if defined(__AVX512VBMI__)
+  bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224FP8, AMX_FP8_MOE_TP>>(moe_module, "AMXFP8_SFT_MOE");
+#endif
   bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int8>>(moe_module, "AMXInt8_SFT_MOE");
   bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int4>>(moe_module, "AMXInt4_SFT_MOE");
   // bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int4_1>>(moe_module, "AMXInt4_1_SFT_MOE");
   // bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int4_1_LowKGroup, AMX_AWQ_MOE_TP>>(moe_module,
   //                                                                                         "AMXInt4_1KGroup_SFT_MOE");
-  // bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int4SmallKGroup, AMX_K2_MOE_TP>>(moe_module,
-  //                                                                                       "AMXInt4_KGroup_SFT_MOE");
+  bind_moe_sft_module<AMX_K2_SFT_MOE_TP<>>(moe_module, "AMXInt4_KGroup_SFT_MOE");
   // SFT MoE with SkipLoRA=true (skip all LoRA computation in backward, only compute base weight grad_input)
-  bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224BF, AMX_MOE_TP, true>>(moe_module, "AMXBF16_SFT_MOE_SkipLoRA");
+  bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224BF16, AMX_BF16_MOE_TP, true>>(moe_module,
+                                                                                     "AMXBF16_SFT_MOE_SkipLoRA");
   bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int8, AMX_MOE_TP, true>>(moe_module, "AMXInt8_SFT_MOE_SkipLoRA");
   bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int4, AMX_MOE_TP, true>>(moe_module, "AMXInt4_SFT_MOE_SkipLoRA");
   // bind_moe_sft_module<AMX_SFT_MOE_TP<amx::GemmKernel224Int4_1, AMX_MOE_TP, true>>(moe_module,
@@ -936,11 +1124,22 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AVX2_GPTQ_INT4_MOE_TP<avx2::GemmKernelAVX2GPTQInt4>>(moe_module, "AVX2GPTQInt4_MOE");
   bind_moe_module<AVX2_RAW_INT4_MOE_TP<avx2::GemmKernelAVX2RawInt4>>(moe_module, "AVX2RawInt4_MOE");
   bind_moe_module<AVX2_MXFP4_MOE_TP<avx2::GemmKernelAVX2MXFP4>>(moe_module, "AVX2MXFP4_MOE");
+#if !defined(USE_AMX_AVX_KERNEL)
+  // AVX2 tier of the MXFP4 routed-expert LoRA SFT (same Python name as the AMX build)
+  bind_moe_sft_module<avx2::AVX2_SFT_MXFP4_MOE_TP<avx2::GemmKernelAVX2MXFP4>>(moe_module, "MXFP4_SFT_MOE");
+  // AVX2 tier of the RAWINT4 routed-expert LoRA SFT (same Python name as the AMX build)
+  bind_moe_sft_module<avx2::AVX2_SFT_RAWINT4_MOE_TP<avx2::GemmKernelAVX2RawInt4>>(moe_module, "AMXInt4_KGroup_SFT_MOE");
+#endif
   bind_moe_module<AVX2_MXFP8_MOE_TP<avx2::GemmKernelAVX2MXFP8>>(moe_module, "AVX2MXFP8_MOE");
   bind_moe_module<AVXVNNI256_GPTQ_INT4_MOE_TP<avxvnni::GemmKernelAVXVNNI256GPTQInt4>>(moe_module,
                                                                                       "AVXVNNI256GPTQInt4_MOE");
+  bind_moe_module<AVXVNNI256_GPTQ_INT4_PACKED_MOE_TP<>>(moe_module, "AVXVNNI256GPTQInt4Packed_MOE");
   bind_moe_module<AVXVNNI256_RAW_INT4_MOE_TP<avxvnni_rawint4::GemmKernelAVXVNNI256RawInt4>>(moe_module,
                                                                                             "AVXVNNI256RawInt4_MOE");
+#endif
+#if defined(USE_SYCL)
+  bind_moe_module<SYCL_GPTQ_INT4_MOE_TP<sycl_int4::GemmKernelSYCLGPTQInt4>>(moe_module, "SYCLGPTQInt4_MOE");
+  bind_moe_module<SYCL_XMX_GPTQ_INT4_MOE_TP>(moe_module, "SYCLXMXGPTQInt4_MOE");
 #endif
 
 #if defined(USE_MOE_KERNEL)
