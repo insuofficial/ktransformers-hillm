@@ -641,8 +641,30 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
         intptr_t skip_mask;
       };
 
+      // True when some routed expert is selected: in range and not skipped by the mask. This is
+      // the test forward_gate_up makes before returning early with nothing to do (skip_expert_).
+      // A null mask leaves the choice to kt's shared mask, so it always enqueues.
+      static bool has_work(const Args* a) {
+        if (a->skip_mask == 0) return true;
+        const int64_t* ids = (const int64_t*)a->expert_ids;
+        const uint8_t* mask = (const uint8_t*)a->skip_mask;
+        const int64_t expert_num = a->moe->config.expert_num;
+        for (int i = 0; i < a->qlen * a->k; ++i) {
+          const int64_t e = ids[i];
+          if (e >= 0 && e < expert_num && !mask[e]) return true;
+        }
+        return false;
+      }
+
+      // An empty gate_up is not enqueued. HiLLM submits gate_up on every decode layer so the
+      // graph stays fixed, but most layers pick no shard expert, and an empty task still costs a
+      // queue hand-off and a worker round trip (2-3 us in a graph replay). Its output is not read
+      // when empty, and a later sync just finds one task fewer. The routing and the mask are read
+      // here, when the host node runs: both are written earlier on the same stream, so this holds
+      // under capture.
       static void inner(void* args) {
         Args* a = (Args*)args;
+        if (!has_work(a)) return;
         a->cpuinfer->enqueue(&MoeClass::forward_gate_up_binding, a->moe, a->qlen, a->k, a->expert_ids, a->weights,
                              a->input, a->output, a->skip_mask);
       }
