@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-efdb0dcf.js";
+            window.path_to_searchindex_js = "searchindex-098aa1bd.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-c2917af9.js"></script>
+        <script src="toc-78d73750.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -195,9 +195,18 @@
 </div>
 
 <h2 id="-overview"><a class="header" href="#-overview">🎯 Overview</a></h2>
-<p>KTransformers is a research project focused on efficient inference and fine-tuning of large language models through CPU-GPU heterogeneous computing. The project now exposes two user-facing capabilities from the kt-kernel source tree: <a href="./kt-kernel/README.html">Inference</a> and <a href="./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.html">SFT</a>.</p>
+<p>KTransformers is a research project focused on efficient inference and fine-tuning of large language models through CPU-GPU heterogeneous computing. The project now exposes two user-facing capabilities from the kt-kernel source tree: <a href="./kt-kernel/README.html">Inference</a> and <a href="./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.html">SFT</a>.</p>
 <h2 id="-updates"><a class="header" href="#-updates">🔥 Updates</a></h2>
 <ul>
+<li><strong>Oct 15, 2026</strong>: <strong>DeepSeek-V4-Flash LoRA fine-tuning</strong> supports native MXFP4 routed experts. <a href="./doc/en/SFT/DeepSeek-V4-Flash-LoRA-Quickstart.html">quickstart</a>.</li>
+<li><strong>Oct 8, 2026</strong>: We release the author preprint of <strong>KTransformers-FineTune (KT-FT)</strong>, presenting layout-aware and schedule-optimized CPU-GPU co-computation for MoE fine-tuning. <a href="./papers/kt-ft/">Paper and citation</a> · <a href="./papers/kt-ft/ktransformers-finetune.pdf">PDF</a>.</li>
+<li><strong>Sep 13, 2026</strong>: <strong>Kimi K2.5 / K2.6 LoRA fine-tuning</strong> is supported with native RAWINT4 routed experts.</li>
+<li><strong>Aug 26, 2026</strong>: Added native support for <strong>GLM-5.3-flash</strong>, bringing 1M-token context and multimodal input to consumer GPUs. (<a href="./doc/en/kt-kernel/GLM-5.3-Flash-Tutorial.html">Tutorial</a>)</li>
+<li><strong>Aug 25, 2026</strong>: Uploaded a new easy-to-use <a href="./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.html">KTransformers × LlamaFactory MoE Fine-Tuning Cookbook</a>, covering hardware checks, installation, BF16/FP8/INT8 recipes, LoRA and full fine-tuning, resource planning, and troubleshooting.</li>
+<li><strong>Aug 17, 2026</strong>: LoRA fine-tuning now supports compatible AVX512 x86 CPUs, including AMD servers, without requiring AMX. (<a href="https://github.com/kvcache-ai/ktransformers/releases/tag/v0.7.0">v0.7.0 Release Notes</a>)</li>
+<li><strong>Aug 16, 2026</strong>: DeepSeek-V4-Flash on a single Ascend NPU with CPU expert offload. (<a href="./doc/en/DeepSeek-V4-Flash_tutorial_for_Ascend_NPU.html">Tutorial</a>)</li>
+<li><strong>Aug 5, 2026</strong>: Introduced native block-FP8 LoRA fine-tuning (<a href="https://github.com/kvcache-ai/ktransformers/pull/2141">PR #2141</a>)</li>
+<li><strong>July 23, 2026</strong>: Added end-to-end BF16 full-parameter fine-tuning for MoE models, including complete checkpoint saving. (<a href="https://github.com/kvcache-ai/ktransformers/pull/2094">PR #2094</a>)</li>
 <li><strong>June 21, 2026</strong>: MiniMax-M3 Day0 Support! (<a href="./doc/en/kt-kernel/MiniMax-M3-Tutorial.html">Tutorial</a>)</li>
 <li><strong>June 17, 2026</strong>: GLM-5.2 Day0 Support! (<a href="./doc/en/kt-kernel/GLM-5.2-Tutorial.html">Tutorial</a>)</li>
 <li><strong>May 6, 2026</strong>: KTransformers at <a href="https://paris2026.gosim.org/zh/schedule/">GOSIM Paris 2026</a> — “Agentic AI on Edge” track. We’ll present KT’s inference performance on consumer hardware.</li>
@@ -230,7 +239,7 @@
 <li><strong>Feb 15, 2025</strong>: Longer Context (from 4K to 8K for 24GB VRAM) &amp; Slightly Faster Speed （+15%, up to 16 Tokens/s), update <a href="./doc/en/DeepseekR1_V3_tutorial.html">docs</a> and <a href="https://kvcache-ai.github.io/ktransformers/">online books</a>.</li>
 <li><strong>Feb 10, 2025</strong>: Support Deepseek-R1 and V3 on single (24GB VRAM)/multi gpu and 382G DRAM, up to 3~28x speedup. For detailed show case and reproduction tutorial, see <a href="./doc/en/DeepseekR1_V3_tutorial.html">here</a>.</li>
 <li><strong>Aug 28, 2024</strong>: Decrease DeepseekV2’s required VRAM from 21G to 11G.</li>
-<li><strong>Aug 15, 2024</strong>: Update detailed <a href="doc/en/injection_tutorial.html">tutorial</a> for injection and multi-GPU.</li>
+<li><strong>Aug 15, 2024</strong>: Update detailed <a href="doc/en/SFT/injection_tutorial.html">tutorial</a> for injection and multi-GPU.</li>
 <li><strong>Aug 14, 2024</strong>: Support llamfile as linear backend.</li>
 <li><strong>Aug 12, 2024</strong>: Support multiple GPU; Support new model: mixtral 8*7B  and 8*22B; Support q2k, q3k, q5k dequant on gpu.</li>
 <li><strong>Aug 9, 2024</strong>: Support windows native.</li>
@@ -270,16 +279,18 @@ pip install .
 </div>
 <p>👉 <strong><a href="./kt-kernel/README.html">Full Documentation →</a></strong></p>
 <hr>
-<h3 id="-sft---fine-tuning-with-llama-factory"><a class="header" href="#-sft---fine-tuning-with-llama-factory">🎓 <a href="./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.html">SFT</a> - Fine-Tuning with LLaMA-Factory</a></h3>
-<p>KTransformers × LLaMA-Factory integration for ultra-large MoE model fine-tuning.</p>
-<p><label class="checkbox-label"><input class="checkbox-img" type="checkbox"><img src="https://raw.githubusercontent.com/kvcache-ai/ktransformers/main/doc/assets/image-20251011010558909.png" alt="KTransformers SFT"><span class="img-wrapper"><img src="https://raw.githubusercontent.com/kvcache-ai/ktransformers/main/doc/assets/image-20251011010558909.png" alt="KTransformers SFT"></span></label></p>
+<h3 id="-sft---fine-tuning-with-llamafactory"><a class="header" href="#-sft---fine-tuning-with-llamafactory">🎓 <a href="./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.html">SFT</a> - Fine-Tuning with LlamaFactory</a></h3>
+<p><strong>Research paper:</strong> <a href="./papers/kt-ft/">KTransformers-FineTune (KT-FT)</a> · <a href="./papers/kt-ft/ktransformers-finetune.pdf">PDF</a>.</p>
+<p>KTransformers × LlamaFactory integration for ultra-large MoE model fine-tuning. The new Cookbook provides an easy-to-use path from hardware checks and installation to BF16/FP8/INT8 configuration, LoRA/full training, resource planning, and troubleshooting.</p>
+<p><strong>Kimi K2.5 / K2.6 LoRA fine-tuning</strong> is supported with native RAWINT4 routed experts. Follow the <a href="./.github/release/examples/kimi-k25/README.html">PyPI installation, training, resume and SGLang serving guide (中文)</a>. End-to-end validation uses Kimi K2.5; K2.6 follows the same model-architecture path.</p>
+<p><label class="checkbox-label"><input class="checkbox-img" type="checkbox"><img src="./doc/assets/llamafactory-kt-integration-overview.png" alt="LlamaFactory and KTransformers MoE fine-tuning architecture"><span class="img-wrapper"><img src="./doc/assets/llamafactory-kt-integration-overview.png" alt="LlamaFactory and KTransformers MoE fine-tuning architecture"></span></label></p>
 <p><strong>Key Features:</strong></p>
 <ul>
 <li><strong>Multi-Backend Support</strong>: CPU/GPU hybrid fine-tuning with INT8/INT4 quantization</li>
 <li><strong>Ultra-Large MoE Support</strong>: Fine-tune models like DeepSeek-V3/R1 on limited GPU memory</li>
 <li><strong>Faster than ZeRO-Offload</strong>: 6-12x training speedup in benchmarked MoE SFT workloads</li>
 <li><strong>Lower CPU Memory</strong>: About half the CPU memory of the previous KT SFT path in the benchmarked setup</li>
-<li><strong>LLaMA-Factory Integration</strong>: Seamless integration with popular fine-tuning framework</li>
+<li><strong>LlamaFactory Integration</strong>: Seamless integration with the popular fine-tuning framework</li>
 </ul>
 <div class="table-wrapper">
 <table>
@@ -295,23 +306,37 @@ pip install .
 </div>
 <p><strong>Quick Start:</strong></p>
 <pre><code class="language-bash">cd /path/to/LLaMA-Factory
-pip install -e .
-pip install -r requirements/ktransformers.txt
+python -m pip install -e .
+python -m pip install "ktransformers[sft]==0.7.0"
+python -m pip install "sglang-kt==0.7.0"
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
   --config_file examples/ktransformers/accelerate/fsdp2_kt_int8.yaml \
   src/train.py \
   examples/ktransformers/train_lora/qwen3_5moe_lora_sft_kt.yaml
 </code></pre>
-<p>👉 <strong><a href="./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.html">Quick Start →</a></strong>
+<p>👉 <strong><a href="./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.html">Easy-to-Use Fine-Tuning Cookbook →</a></strong>
+👉 <strong><a href="./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.html">Quick Start →</a></strong>
 👉 <strong><a href="./doc/en/SFT/KTransformers-Fine-Tuning_User-Guide.html">Full Documentation →</a></strong></p>
 <hr>
 <h2 id="-citation"><a class="header" href="#-citation">🔥 Citation</a></h2>
-<p>If you use KTransformers in your research, please cite our paper:</p>
+<p>If you use KTransformers in your research, please cite the relevant paper.</p>
+<h3 id="inference-paper"><a class="header" href="#inference-paper">Inference paper</a></h3>
 <pre><code class="language-bibtex">@inproceedings{10.1145/3731569.3764843,
   title = {KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models},
   author = {Chen, Hongtao and Xie, Weiyu and Zhang, Boxin and Tang, Jingqi and Wang, Jiahao and Dong, Jianwei and Chen, Shaoyuan and Yuan, Ziwei and Lin, Chen and Qiu, Chengyu and Zhu, Yuening and Ou, Qingliang and Liao, Jiaqi and Chen, Xianglin and Ai, Zhiyuan and Wu, Yongwei and Zhang, Mingxing},
   booktitle = {Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles},
   year = {2025}
+}
+</code></pre>
+<h3 id="fine-tuning-paper"><a class="header" href="#fine-tuning-paper">Fine-tuning paper</a></h3>
+<p><a href="./papers/kt-ft/">KTransformers-FineTune (KT-FT)</a> · <a href="./papers/kt-ft/CITATION.bib">Full BibTeX</a></p>
+<pre><code class="language-bibtex">@misc{li2026ktft,
+  title = {{KTransformers-FineTune: Beyond Offload with Layout-Aware and Schedule-Optimized Heterogeneous MoE Fine-Tuning}},
+  author = {Li, Peilin and Hao, Xingxing and Chen, Hongtao and Xie, Weiyu and Zheng, Yaowei and Wu, Bowen and Yang, Yujie and Shen, Huanming and Ou, Qingliang and Zhang, Boxin and Tang, Jingqi and Yuan, Ziwei and Dong, Jianwei and Kuang, Dongdong and Feng, Zhangchi and Dai, Jiaheng and Yang, Qianrui and Chen, Shaoyuan and Wang, Jiahao and Han, Yaochen and Zhu, Yuening and Liao, Jiaqi and Chen, Xianglin and Ai, Zhiyuan and Wu, Yongwei and Zhang, Mingxing},
+  year = {2026},
+  note = {Author preprint, version paper-ktft-v1.1},
+  howpublished = {Author preprint, GitHub},
+  url = {https://github.com/kvcache-ai/ktransformers/tree/paper-ktft-v1.1/papers/kt-ft}
 }
 </code></pre>
 <h2 id="-contributors--team"><a class="header" href="#-contributors--team">👥 Contributors &amp; Team</a></h2>
